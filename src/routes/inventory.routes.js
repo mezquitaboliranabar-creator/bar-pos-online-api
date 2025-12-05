@@ -6,10 +6,12 @@ const { authMiddleware } = require("./auth.routes");
 // Crea el router para agrupar las rutas de inventario
 const router = express.Router();
 
-// Define un middleware para restringir acceso a administradores
+// Middleware para restringir acceso a administradores
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== "admin") {
-    return res.status(403).json({ ok: false, error: "Acceso restringido a administradores" });
+    return res
+      .status(403)
+      .json({ ok: false, error: "Acceso restringido a administradores" });
   }
   next();
 }
@@ -23,7 +25,7 @@ function computeCostTotal(move) {
   return unitCost * qty - discount + tax;
 }
 
-// Define la ruta para listar movimientos de inventario con filtros avanzados
+// Lista movimientos de inventario con filtros
 router.get("/moves", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const {
@@ -56,12 +58,8 @@ router.get("/moves", authMiddleware, requireAdmin, async (req, res) => {
 
     if (from || to) {
       const range = {};
-      if (from) {
-        range.$gte = new Date(from);
-      }
-      if (to) {
-        range.$lte = new Date(to);
-      }
+      if (from) range.$gte = new Date(from);
+      if (to) range.$lte = new Date(to);
       and.push({ createdAt: range });
     }
 
@@ -74,12 +72,8 @@ router.get("/moves", authMiddleware, requireAdmin, async (req, res) => {
 
     if (category || inv_type) {
       const prodFilter = {};
-      if (category) {
-        prodFilter.category = category;
-      }
-      if (inv_type) {
-        prodFilter.inv_type = String(inv_type).toUpperCase();
-      }
+      if (category) prodFilter.category = category;
+      if (inv_type) prodFilter.inv_type = String(inv_type).toUpperCase();
       const prodIds = await Product.find(prodFilter).distinct("_id");
       and.push({ product: { $in: prodIds } });
     }
@@ -111,11 +105,14 @@ router.get("/moves", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al listar movimientos de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al listar movimientos de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al listar movimientos de inventario",
+    });
   }
 });
 
-// Define la ruta para obtener el detalle de un movimiento de inventario
+// Detalle de un movimiento de inventario
 router.get("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -125,7 +122,9 @@ router.get("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
       .populate("user", "username name role");
 
     if (!move) {
-      return res.status(404).json({ ok: false, error: "Movimiento no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Movimiento no encontrado" });
     }
 
     const obj = move.toJSON();
@@ -137,11 +136,14 @@ router.get("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener movimiento de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener movimiento de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al obtener movimiento de inventario",
+    });
   }
 });
 
-// Define la ruta para crear un nuevo movimiento de inventario general
+// Crear un movimiento general de inventario
 router.post("/moves", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const {
@@ -173,14 +175,19 @@ router.post("/moves", authMiddleware, requireAdmin, async (req, res) => {
     const product = await Product.findById(productId);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
     const delta = numericQty;
     const newStock = product.stock + delta;
 
     if (newStock < 0) {
-      return res.status(400).json({ ok: false, error: "El movimiento dejaría stock negativo" });
+      return res.status(400).json({
+        ok: false,
+        error: "El movimiento dejaría stock negativo",
+      });
     }
 
     product.stock = newStock;
@@ -197,8 +204,10 @@ router.post("/moves", authMiddleware, requireAdmin, async (req, res) => {
       supplierId: supplierId || null,
       supplierName: supplierName || null,
       invoiceNumber: invoiceNumber || null,
-      unitCost: unitCost !== undefined && unitCost !== null ? Number(unitCost) : null,
-      discount: discount !== undefined && discount !== null ? Number(discount) : null,
+      unitCost:
+        unitCost !== undefined && unitCost !== null ? Number(unitCost) : null,
+      discount:
+        discount !== undefined && discount !== null ? Number(discount) : null,
       tax: tax !== undefined && tax !== null ? Number(tax) : null,
       lot: lot || null,
       expiryDate: expiryDate ? new Date(expiryDate) : null,
@@ -214,11 +223,14 @@ router.post("/moves", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al crear movimiento de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al crear movimiento de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al crear movimiento de inventario",
+    });
   }
 });
 
-// Define la ruta para ingresar stock rápido de un producto
+// Ingreso rápido de stock para un producto
 router.post("/add-stock", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { productId, qty, note, location } = req.body;
@@ -226,15 +238,19 @@ router.post("/add-stock", authMiddleware, requireAdmin, async (req, res) => {
     const numericQty = Number(qty);
 
     if (!productId || !(numericQty > 0)) {
-      return res.status(400).json({ ok: false, error: "productId y qty > 0 son requeridos" });
+      return res.status(400).json({
+        ok: false,
+        error: "productId y qty > 0 son requeridos",
+      });
     }
 
     const product = await Product.findById(productId);
 
     if (!product || !product.is_active) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Producto no encontrado o inactivo" });
+      return res.status(404).json({
+        ok: false,
+        error: "Producto no encontrado o inactivo",
+      });
     }
 
     const newStock = product.stock + numericQty;
@@ -270,11 +286,14 @@ router.post("/add-stock", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error en add-stock de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error en add-stock de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error en add-stock de inventario",
+    });
   }
 });
 
-// Define la ruta para ajustar el stock de un producto a un valor específico
+// Ajustar el stock de un producto a un valor específico
 router.post("/adjust", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { productId, stock, note, location } = req.body;
@@ -282,7 +301,9 @@ router.post("/adjust", authMiddleware, requireAdmin, async (req, res) => {
     const product = await Product.findById(productId);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
     const currentStock = Number(product.stock || 0);
@@ -300,7 +321,10 @@ router.post("/adjust", authMiddleware, requireAdmin, async (req, res) => {
     const newStock = currentStock + delta;
 
     if (newStock < 0) {
-      return res.status(400).json({ ok: false, error: "El ajuste dejaría stock negativo" });
+      return res.status(400).json({
+        ok: false,
+        error: "El ajuste dejaría stock negativo",
+      });
     }
 
     product.stock = newStock;
@@ -335,11 +359,132 @@ router.post("/adjust", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al ajustar stock de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al ajustar stock de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al ajustar stock de inventario",
+    });
   }
 });
 
-// Define la ruta para eliminar un movimiento de inventario y revertir el stock
+// Ingreso con proveedor / factura (múltiples líneas)
+router.post("/receive", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const {
+      items,
+      location,
+      supplierId,
+      supplierName,
+      invoiceNumber,
+      note,
+    } = req.body || {};
+
+    const lines = Array.isArray(items) ? items : [];
+
+    if (!lines.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "No hay líneas para registrar el ingreso",
+      });
+    }
+
+    const createdMoves = [];
+    let invoiceTotal = 0;
+
+    for (const line of lines) {
+      const productId = line.productId || line.product_id;
+      const qtyN = Number(line.qty);
+
+      if (!productId || !(qtyN > 0)) {
+        continue;
+      }
+
+      const unitCost =
+        line.unitCost !== undefined && line.unitCost !== null
+          ? Number(line.unitCost)
+          : line.unit_cost !== undefined && line.unit_cost !== null
+          ? Number(line.unit_cost)
+          : null;
+
+      const discount =
+        line.discount !== undefined && line.discount !== null
+          ? Number(line.discount)
+          : null;
+
+      const tax =
+        line.tax !== undefined && line.tax !== null ? Number(line.tax) : null;
+
+      const lot = line.lot || null;
+      const expiryRaw = line.expiryDate || line.expiry_date || null;
+      const expiryDate = expiryRaw ? new Date(expiryRaw) : null;
+
+      const product = await Product.findById(productId);
+
+      if (!product || !product.is_active) {
+        return res.status(404).json({
+          ok: false,
+          error: "Producto no encontrado o inactivo en una de las líneas",
+        });
+      }
+
+      const newStock = product.stock + qtyN;
+
+      if (newStock < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "El ingreso dejaría stock negativo en una de las líneas",
+        });
+      }
+
+      product.stock = newStock;
+      await product.save();
+
+      const move = await InventoryMove.create({
+        product: product._id,
+        qty: qtyN,
+        note: note || "Ingreso de proveedor",
+        user: req.user ? req.user.id : null,
+        type: "IN",
+        sourceRef: null,
+        location: location || null,
+        supplierId: supplierId || null,
+        supplierName: supplierName || null,
+        invoiceNumber: invoiceNumber || null,
+        unitCost,
+        discount,
+        tax,
+        lot,
+        expiryDate,
+      });
+
+      const obj = move.toJSON();
+      obj.cost_total = computeCostTotal(obj);
+      invoiceTotal += obj.cost_total;
+      createdMoves.push(obj);
+    }
+
+    if (!createdMoves.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "No se pudo registrar ninguna línea de ingreso",
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      moves: createdMoves,
+      total: createdMoves.length,
+      invoice_total: invoiceTotal,
+    });
+  } catch (error) {
+    console.error("Error en receive de inventario:", error.message);
+    return res.status(500).json({
+      ok: false,
+      error: "Error en receive de inventario",
+    });
+  }
+});
+
+// Eliminar un movimiento de inventario y revertir stock
 router.delete("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -347,13 +492,17 @@ router.delete("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
     const move = await InventoryMove.findById(id);
 
     if (!move) {
-      return res.status(404).json({ ok: false, error: "Movimiento no existe" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Movimiento no existe" });
     }
 
     const product = await Product.findById(move.product);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no existe" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no existe" });
     }
 
     const newStock = Number(product.stock || 0) - Number(move.qty || 0);
@@ -373,11 +522,14 @@ router.delete("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
     return res.json({ ok: true });
   } catch (error) {
     console.error("Error al eliminar movimiento de inventario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al eliminar movimiento de inventario" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al eliminar movimiento de inventario",
+    });
   }
 });
 
-// Define la ruta para obtener el resumen de productos con bajo stock
+// Resumen de productos con bajo stock
 router.get("/low-stock", authMiddleware, requireAdmin, async (_req, res) => {
   try {
     const products = await Product.find({
@@ -405,7 +557,57 @@ router.get("/low-stock", authMiddleware, requireAdmin, async (_req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener resumen de bajo stock:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener resumen de bajo stock" });
+    return res.status(500).json({
+      ok: false,
+      error: "Error al obtener resumen de bajo stock",
+    });
+  }
+});
+
+// Exportar inventario en JSON para informes o CSV
+router.post("/export", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { include_inactive = false, category, inv_type } = req.body || {};
+
+    const filter = {};
+    if (!include_inactive) {
+      filter.is_active = true;
+    }
+    if (category) {
+      filter.category = category;
+    }
+    if (inv_type) {
+      filter.inv_type = String(inv_type).toUpperCase();
+    }
+
+    const products = await Product.find(filter).sort({
+      category: 1,
+      name: 1,
+    });
+
+    const items = products.map((p) => ({
+      id: p.id,
+      name: p.name,
+      category: p.category,
+      stock: p.stock,
+      min_stock: p.min_stock,
+      price: p.price,
+      inv_type: p.inv_type,
+      kind: p.kind,
+      measure: p.measure,
+    }));
+
+    return res.json({
+      ok: true,
+      items,
+      total: items.length,
+    });
+  } catch (error) {
+    console.error("Error al exportar inventario:", error.message);
+    return res.status(500).json({
+      ok: false,
+      error: "Error al exportar inventario",
+    });
   }
 });
 
