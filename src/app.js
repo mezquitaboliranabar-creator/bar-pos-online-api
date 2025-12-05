@@ -9,7 +9,7 @@ const { authRouter } = require("./routes/auth.routes");
 // Importa el router de usuarios
 const { usersRouter } = require("./routes/users.routes");
 
-// Importa dl router de productos
+// Importa el router de productos
 const { productsRouter } = require("./routes/products.routes");
 
 // Importa el router de inventario 
@@ -22,19 +22,32 @@ const { recipesRouter } = require("./routes/recipes.routes");
 // Importa el router de tabs
 const { tabsRouter } = require("./routes/tabs.routes");
 
-
-
-
-
-
 // Crea la instancia de la aplicación Express
 const app = express();
+
+// Define orígenes permitidos para CORS
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
 // Configura middlewares de seguridad y CORS
 app.use(helmet());
 app.use(
   cors({
-    origin: "*",
+    origin(origin, callback) {
+      // Permite peticiones sin origen (Postman, curl, health checks)
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`Origen no permitido por CORS: ${origin}`));
+    },
+    credentials: true,
   })
 );
 
@@ -68,15 +81,16 @@ app.use("/api/users", usersRouter);
 // Monta las rutas de productos bajo el prefijo /api/products
 app.use("/api/products", productsRouter);
 
-// Monta las rutas de inventario bajo el prefijo /api/inventory/moves
+// Monta las rutas de inventario bajo el prefijo /api/inventory
 app.use("/api/inventory", inventoryRouter);
 
-// Monta las rutas de ventas bajo el prefijo /api/sales /api/sales/catalog /api/sales/payments/summary
+// Monta las rutas de ventas bajo el prefijo /api/sales
 app.use("/api/sales", salesRouter);
 
 // Monta las rutas de tabs bajo el prefijo /api/tabs
 app.use("/api/tabs", tabsRouter);
 
+// Monta las rutas de recetas bajo el prefijo /api/recipes
 app.use("/api/recipes", recipesRouter);
 
 // Exporta la aplicación configurada para usarla en server.js
