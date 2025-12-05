@@ -16,7 +16,9 @@ function authMiddleware(req, res, next) {
   const [scheme, token] = authHeader.split(" ");
 
   if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ ok: false, error: "Token no proporcionado" });
+    return res
+      .status(401)
+      .json({ ok: false, error: "Token no proporcionado" });
   }
 
   try {
@@ -29,30 +31,66 @@ function authMiddleware(req, res, next) {
     };
     next();
   } catch (_error) {
-    return res.status(401).json({ ok: false, error: "Token inválido o expirado" });
+    return res
+      .status(401)
+      .json({ ok: false, error: "Token inválido o expirado" });
   }
 }
 
-// Define la ruta de login para validar credenciales y devolver un token JWT
-router.post("/login", async (req, res) => {
+// Ruta para saber si existen usuarios en el sistema
+router.get("/hasUsers", async (_req, res) => {
   try {
-    const { username, pin } = req.body;
+    const count = await User.countDocuments();
+    return res.json({
+      ok: true,
+      hasUsers: count > 0,
+    });
+  } catch (error) {
+    console.error("Error en /hasUsers:", error);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error verificando usuarios" });
+  }
+});
 
-    if (!username || !pin) {
-      return res.status(400).json({ ok: false, error: "Usuario y PIN son requeridos" });
+// Ruta para registrar el primer administrador (solo si no hay usuarios)
+router.post("/register-first-admin", async (req, res) => {
+  try {
+    const { name, username, pin } = req.body;
+
+    if (!name || !username || !pin) {
+      return res.status(400).json({
+        ok: false,
+        error: "name, username y pin son requeridos",
+      });
     }
 
-    const user = await User.findOne({ username });
-
-    if (!user || !user.isActive) {
-      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    const totalUsers = await User.countDocuments();
+    if (totalUsers > 0) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Ya existen usuarios en el sistema. Esta ruta solo es para el primer administrador.",
+      });
     }
 
-    const isValidPin = await bcrypt.compare(pin, user.pinHash);
-
-    if (!isValidPin) {
-      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    const existing = await User.findOne({ username });
+    if (existing) {
+      return res.status(409).json({
+        ok: false,
+        error: "El nombre de usuario ya existe",
+      });
     }
+
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    const user = await User.create({
+      name,
+      username,
+      role: "admin",
+      pinHash,
+      isActive: true,
+    });
 
     const payload = {
       id: user.id,
@@ -63,6 +101,57 @@ router.post("/login", async (req, res) => {
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
+    return res.status(201).json({
+      ok: true,
+      token,
+      user: user.toJSON(),
+    });
+  } catch (error) {
+    console.error("Error en register-first-admin:", error);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al registrar primer administrador" });
+  }
+});
+
+// Define la ruta de login para validar credenciales y devolver un token JWT
+router.post("/login", async (req, res) => {
+  try {
+    const { username, pin } = req.body;
+
+    if (!username || !pin) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Usuario y PIN son requeridos" });
+    }
+
+    const user = await User.findOne({ username });
+
+    if (!user || !user.isActive) {
+      return res
+        .status(401)
+        .json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    const isValidPin = await bcrypt.compare(pin, user.pinHash);
+
+    if (!isValidPin) {
+      return res
+        .status(401)
+        .json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    const payload = {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, {
+      expiresIn: JWT_EXPIRES_IN,
+    });
+
     return res.json({
       ok: true,
       token,
@@ -70,12 +159,22 @@ router.post("/login", async (req, res) => {
     });
   } catch (error) {
     console.error("Error en login:", error);
-    return res.status(500).json({ ok: false, error: "Error interno en login" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error interno en login" });
   }
 });
 
 // Define la ruta para obtener los datos del usuario autenticado
 router.get("/me", authMiddleware, (req, res) => {
+  return res.json({
+    ok: true,
+    user: req.user,
+  });
+});
+
+// Alias /current por compatibilidad (mismo comportamiento que /me)
+router.get("/current", authMiddleware, (req, res) => {
   return res.json({
     ok: true,
     user: req.user,
