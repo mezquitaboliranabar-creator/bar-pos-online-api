@@ -12,15 +12,61 @@ const {
 // Crea el router para agrupar las rutas de productos
 const router = express.Router();
 
-// Define un middleware para asegurar que el usuario tenga rol admin
+// Middleware para asegurar que el usuario tenga rol admin
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== "admin") {
-    return res.status(403).json({ ok: false, error: "Acceso restringido a administradores" });
+    return res
+      .status(403)
+      .json({ ok: false, error: "Acceso restringido a administradores" });
   }
   next();
 }
 
-// Define la ruta para obtener la lista de productos con filtros avanzados
+/* ========== RUTAS DE METADATOS (CATEGORÍAS) ========== */
+
+// Handler común para categorías activas
+async function handleCategories(req, res) {
+  try {
+    const rows = await Product.aggregate([
+      { $match: { is_active: true } },
+      {
+        $group: {
+          _id: {
+            $trim: { input: { $ifNull: ["$category", ""] } },
+          },
+          n: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    const items = rows.map((r) => ({
+      category: r._id || "Sin categoría",
+      n: r.n,
+    }));
+
+    return res.json({
+      ok: true,
+      items,
+      total: items.length,
+    });
+  } catch (error) {
+    console.error("Error al obtener categorías de productos:", error.message);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al obtener categorías de productos" });
+  }
+}
+
+// Alias nuevo: /api/products/categories (para el frontend)
+router.get("/categories", authMiddleware, handleCategories);
+
+// Ruta original: /api/products/_meta/categories
+router.get("/_meta/categories", authMiddleware, handleCategories);
+
+/* ========== LISTADO Y DETALLE ========== */
+
+// Lista de productos con filtros avanzados
 router.get("/", authMiddleware, async (req, res) => {
   try {
     const {
@@ -87,11 +133,13 @@ router.get("/", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al listar productos:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al listar productos" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al listar productos" });
   }
 });
 
-// Define la ruta para obtener un producto específico por su identificador
+// Detalle de un producto por id
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -99,7 +147,9 @@ router.get("/:id", authMiddleware, async (req, res) => {
     const product = await Product.findById(id);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
     const obj = product.toJSON();
@@ -111,43 +161,15 @@ router.get("/:id", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener producto:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener producto" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al obtener producto" });
   }
 });
 
-// Define la ruta para obtener el resumen de categorías activas
-router.get("/_meta/categories", authMiddleware, async (_req, res) => {
-  try {
-    const rows = await Product.aggregate([
-      { $match: { is_active: true } },
-      {
-        $group: {
-          _id: {
-            $trim: { input: { $ifNull: ["$category", ""] } },
-          },
-          n: { $sum: 1 },
-        },
-      },
-      { $sort: { "_id": 1 } },
-    ]);
+/* ========== CREAR / ACTUALIZAR / ESTADO / ELIMINAR ========== */
 
-    const items = rows.map((r) => ({
-      category: r._id || "Sin categoría",
-      n: r.n,
-    }));
-
-    return res.json({
-      ok: true,
-      items,
-      total: items.length,
-    });
-  } catch (error) {
-    console.error("Error al obtener categorías de productos:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener categorías de productos" });
-  }
-});
-
-// Define la ruta para crear un nuevo producto con ajuste de stock opcional
+// Crear un nuevo producto con ajuste de stock opcional
 router.post("/", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const payload = req.body || {};
@@ -158,18 +180,17 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
       (payload.inv_type ? mapInvTypeToKind(payload.inv_type) : undefined);
 
     const kind = normalizeKind(incomingKind);
-    const {
-      name,
-      category = "",
-      stock = 0,
-      min_stock = 0,
-      measure,
-    } = payload;
+    const { name, category = "", stock = 0, min_stock = 0, measure } = payload;
 
     const priceN = Number(payload.price);
 
-    if (!name || (kind !== "BASE" && kind !== "ACCOMP" && Number.isNaN(priceN))) {
-      return res.status(400).json({ ok: false, error: "Datos inválidos para producto" });
+    if (
+      !name ||
+      (kind !== "BASE" && kind !== "ACCOMP" && Number.isNaN(priceN))
+    ) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Datos inválidos para producto" });
     }
 
     const stockN = Math.max(0, parseInt(stock, 10) || 0);
@@ -192,7 +213,7 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
     });
 
     if (stockN > 0) {
-      const move = await InventoryMove.create({
+      await InventoryMove.create({
         product: product._id,
         qty: stockN,
         note: "Stock inicial al crear producto",
@@ -218,17 +239,21 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
     const obj = fresh.toJSON();
     obj.inv_type = mapKindToInvType(obj.kind);
 
+    // Devolvemos product e item para compatibilidad con el frontend
     return res.status(201).json({
       ok: true,
       product: obj,
+      item: obj,
     });
   } catch (error) {
     console.error("Error al crear producto:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al crear producto" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al crear producto" });
   }
 });
 
-// Define la ruta para actualizar un producto y registrar ajuste de stock si cambia
+// Actualizar un producto y registrar ajuste de stock si cambia
 router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -236,7 +261,9 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
     const product = await Product.findById(id);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
     const incomingKind =
@@ -245,9 +272,13 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
       payload.product_type ??
       (payload.inv_type ? mapInvTypeToKind(payload.inv_type) : undefined);
 
-    const nextKind = incomingKind == null ? product.kind : normalizeKind(incomingKind);
+    const nextKind =
+      incomingKind == null ? product.kind : normalizeKind(incomingKind);
 
-    const nextMeasure = normalizeMeasureForKind(nextKind, payload.measure ?? product.measure);
+    const nextMeasure = normalizeMeasureForKind(
+      nextKind,
+      payload.measure ?? product.measure
+    );
 
     let nextPrice;
 
@@ -283,7 +314,17 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
     }
 
     if (payload.min_stock !== undefined) {
-      product.min_stock = Math.max(0, parseInt(payload.min_stock, 10) || 0);
+      product.min_stock = Math.max(
+        0,
+        parseInt(payload.min_stock, 10) || 0
+      );
+    }
+
+    // Permite actualizar estado activo desde PUT si viene en el payload
+    if (payload.is_active !== undefined) {
+      product.is_active = Boolean(payload.is_active);
+    } else if (payload.isActive !== undefined) {
+      product.is_active = Boolean(payload.isActive);
     }
 
     product.price = nextPrice;
@@ -317,29 +358,36 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
     const obj = fresh.toJSON();
     obj.inv_type = mapKindToInvType(obj.kind);
 
+    // Devolvemos product e item para el frontend
     return res.json({
       ok: true,
       product: obj,
+      item: obj,
     });
   } catch (error) {
     console.error("Error al actualizar producto:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al actualizar producto" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al actualizar producto" });
   }
 });
 
-// Define la ruta para cambiar el estado activo de un producto
+// Cambiar el estado activo de un producto
 router.patch("/:id/status", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { is_active } = req.body;
+    const { is_active, isActive } = req.body;
 
     const product = await Product.findById(id);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
-    product.is_active = Boolean(is_active);
+    const next = is_active !== undefined ? is_active : isActive;
+    product.is_active = Boolean(next);
     await product.save();
 
     const obj = product.toJSON();
@@ -348,14 +396,17 @@ router.patch("/:id/status", authMiddleware, requireAdmin, async (req, res) => {
     return res.json({
       ok: true,
       product: obj,
+      item: obj,
     });
   } catch (error) {
     console.error("Error al cambiar estado de producto:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al cambiar estado de producto" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al cambiar estado de producto" });
   }
 });
 
-// Define la ruta para eliminar un producto verificando que no tenga movimientos
+// Eliminar un producto verificando que no tenga movimientos
 router.delete("/:id", authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -363,7 +414,9 @@ router.delete("/:id", authMiddleware, requireAdmin, async (req, res) => {
     const product = await Product.findById(id);
 
     if (!product) {
-      return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
     }
 
     const hasMoves = await InventoryMove.exists({ product: id });
@@ -371,7 +424,8 @@ router.delete("/:id", authMiddleware, requireAdmin, async (req, res) => {
     if (hasMoves) {
       return res.status(400).json({
         ok: false,
-        error: "No se puede eliminar: el producto ya tiene movimientos. Desactívalo en su lugar.",
+        error:
+          "No se puede eliminar: el producto ya tiene movimientos. Desactívalo en su lugar.",
       });
     }
 
@@ -380,7 +434,9 @@ router.delete("/:id", authMiddleware, requireAdmin, async (req, res) => {
     return res.json({ ok: true });
   } catch (error) {
     console.error("Error al eliminar producto:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al eliminar producto" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al eliminar producto" });
   }
 });
 
