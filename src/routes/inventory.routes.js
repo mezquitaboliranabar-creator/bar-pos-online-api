@@ -143,6 +143,146 @@ router.get("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
   }
 });
 
+// Editar un movimiento de inventario y ajustar stock
+router.put("/moves/:id", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      qty,
+      note,
+      location,
+      supplierId,
+      supplierName,
+      invoiceNumber,
+      unitCost,
+      discount,
+      tax,
+      lot,
+      expiryDate,
+      type,
+    } = req.body || {};
+
+    const move = await InventoryMove.findById(id);
+
+    if (!move) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Movimiento no encontrado" });
+    }
+
+    const product = await Product.findById(move.product);
+
+    if (!product) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Producto no encontrado" });
+    }
+
+    const currentStock = Number(product.stock || 0);
+    const oldQty = Number(move.qty || 0);
+
+    const newQtyRaw =
+      qty !== undefined && qty !== null && qty !== ""
+        ? Number(qty)
+        : oldQty;
+
+    if (!Number.isFinite(newQtyRaw) || newQtyRaw < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "qty debe ser un número válido mayor o igual a 0",
+      });
+    }
+
+    const newQty = newQtyRaw;
+    const delta = newQty - oldQty;
+    const newStock = currentStock + delta;
+
+    if (newStock < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "La edición dejaría el stock negativo",
+      });
+    }
+
+    product.stock = newStock;
+    await product.save();
+
+    move.qty = newQty;
+
+    if (note !== undefined) {
+      move.note = note || "";
+    }
+    if (location !== undefined) {
+      move.location = location || null;
+    }
+    if (supplierId !== undefined) {
+      move.supplierId =
+        supplierId !== null && supplierId !== ""
+          ? Number(supplierId)
+          : null;
+    }
+    if (supplierName !== undefined) {
+      move.supplierName = supplierName || null;
+    }
+    if (invoiceNumber !== undefined) {
+      move.invoiceNumber = invoiceNumber || null;
+    }
+
+    if (unitCost !== undefined) {
+      if (unitCost === null || unitCost === "") {
+        move.unitCost = null;
+      } else {
+        move.unitCost = Number(unitCost);
+      }
+    }
+
+    if (discount !== undefined) {
+      if (discount === null || discount === "") {
+        move.discount = null;
+      } else {
+        move.discount = Number(discount);
+      }
+    }
+
+    if (tax !== undefined) {
+      if (tax === null || tax === "") {
+        move.tax = null;
+      } else {
+        move.tax = Number(tax);
+      }
+    }
+
+    if (lot !== undefined) {
+      move.lot = lot || null;
+    }
+
+    if (expiryDate !== undefined) {
+      move.expiryDate = expiryDate ? new Date(expiryDate) : null;
+    }
+
+    if (type !== undefined) {
+      move.type = type ? String(type).toUpperCase() : null;
+    }
+
+    await move.save();
+
+    const obj = move.toJSON();
+    obj.cost_total = computeCostTotal(obj);
+
+    return res.json({
+      ok: true,
+      move: obj,
+      product: product.toJSON(),
+    });
+  } catch (error) {
+    console.error("Error al editar movimiento de inventario:", error.message);
+    return res.status(500).json({
+      ok: false,
+      error: "Error al editar movimiento de inventario",
+    });
+  }
+});
+
 // Crear un movimiento general de inventario
 router.post("/moves", authMiddleware, requireAdmin, async (req, res) => {
   try {
