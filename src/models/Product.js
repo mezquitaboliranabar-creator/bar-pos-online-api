@@ -20,7 +20,7 @@ const ProductSchema = new mongoose.Schema(
 
     inv_type: {
       type: String,
-      enum: ["UNIT", "BASE", "ACCOMP"],
+      enum: ["UNIT", "BASE", "ACCOMP", "COCKTAIL"],
       default: "UNIT",
     },
 
