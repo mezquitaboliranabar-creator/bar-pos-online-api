@@ -184,27 +184,37 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
 
     const priceN = Number(payload.price);
 
+    // Para BASE / ACCOMP el precio se ignora; para STANDARD / COCKTAIL se exige número
     if (
       !name ||
-      (kind !== "BASE" && kind !== "ACCOMP" && Number.isNaN(priceN))
+      (kind !== "BASE" &&
+        kind !== "ACCOMP" &&
+        (Number.isNaN(priceN) || priceN < 0))
     ) {
       return res
         .status(400)
         .json({ ok: false, error: "Datos inválidos para producto" });
     }
 
-    const stockN = Math.max(0, parseInt(stock, 10) || 0);
+    // Para cócteles, el stock no se maneja manualmente
+    const allowManualStock = kind !== "COCKTAIL";
+
+    const stockN = allowManualStock
+      ? Math.max(0, parseInt(stock, 10) || 0)
+      : 0;
     const minStockN = Math.max(0, parseInt(min_stock, 10) || 0);
 
     const normalizedMeasure = normalizeMeasureForKind(kind, measure);
 
-    const priceFinal = kind === "BASE" || kind === "ACCOMP" ? 0 : priceN;
+    // Para BASE/ACCOMP el precio de venta es 0; STANDARD/COCKTAIL usan el precio indicado
+    const priceFinal =
+      kind === "BASE" || kind === "ACCOMP" ? 0 : priceN || 0;
 
     const product = await Product.create({
       name,
       category: String(category || "").trim(),
       price: priceFinal,
-      stock: 0,
+      stock: 0, // el stock de cocteles se deriva de los ingredientes
       min_stock: minStockN,
       is_active: true,
       kind,
@@ -212,7 +222,8 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
       measure: normalizedMeasure,
     });
 
-    if (stockN > 0) {
+    // Solo crear movimiento de stock inicial si el producto NO es COCKTAIL
+    if (allowManualStock && stockN > 0) {
       await InventoryMove.create({
         product: product._id,
         qty: stockN,
@@ -286,7 +297,7 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
       nextPrice = 0;
     } else if (payload.price !== undefined) {
       const priceN = Number(payload.price);
-      if (Number.isNaN(priceN)) {
+      if (Number.isNaN(priceN) || priceN < 0) {
         return res.status(400).json({ ok: false, error: "Precio inválido" });
       }
       nextPrice = priceN;
@@ -295,12 +306,16 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
     }
 
     const currentStock = product.stock;
-    let requestedStock = payload.stock;
-
     let deltaRequested = 0;
 
-    if (requestedStock !== undefined) {
-      const stockN = Math.max(0, parseInt(requestedStock, 10) || 0);
+    // Para COCKTAIL no se admite stock manual; se fuerza a 0
+    if (nextKind === "COCKTAIL") {
+      if (currentStock !== 0) {
+        deltaRequested = -currentStock;
+        product.stock = 0;
+      }
+    } else if (payload.stock !== undefined) {
+      const stockN = Math.max(0, parseInt(payload.stock, 10) || 0);
       deltaRequested = stockN - currentStock;
       product.stock = stockN;
     }
@@ -334,11 +349,15 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
 
     await product.save();
 
+    // Solo registramos movimiento de ajuste si realmente hay delta
     if (deltaRequested !== 0) {
       await InventoryMove.create({
         product: product._id,
         qty: deltaRequested,
-        note: "Ajuste desde products:update",
+        note:
+          nextKind === "COCKTAIL"
+            ? "Ajuste a 0 al convertir en cóctel"
+            : "Ajuste desde products:update",
         user: req.user ? req.user.id : null,
         type: "ADJUST",
         sourceRef: null,
