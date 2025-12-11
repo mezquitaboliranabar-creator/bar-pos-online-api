@@ -9,7 +9,9 @@ const router = express.Router();
 // Define un middleware para asegurar que el usuario tenga rol admin
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== "admin") {
-    return res.status(403).json({ ok: false, error: "Acceso restringido a administradores" });
+    return res
+      .status(403)
+      .json({ ok: false, error: "Acceso restringido a administradores" });
   }
   next();
 }
@@ -24,7 +26,9 @@ router.get("/", authMiddleware, requireAdmin, async (_req, res) => {
     });
   } catch (error) {
     console.error("Error al listar usuarios:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al listar usuarios" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al listar usuarios" });
   }
 });
 
@@ -34,12 +38,19 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
     const { username, name, role, pin } = req.body;
 
     if (!username || !name || !role || !pin) {
-      return res.status(400).json({ ok: false, error: "username, name, role y pin son requeridos" });
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "username, name, role y pin son requeridos",
+        });
     }
 
     const existing = await User.findOne({ username });
     if (existing) {
-      return res.status(409).json({ ok: false, error: "El nombre de usuario ya existe" });
+      return res
+        .status(409)
+        .json({ ok: false, error: "El nombre de usuario ya existe" });
     }
 
     if (!["admin", "vendedor"].includes(role)) {
@@ -62,7 +73,9 @@ router.post("/", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al crear usuario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al crear usuario" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al crear usuario" });
   }
 });
 
@@ -74,7 +87,9 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
 
     const user = await User.findById(id);
     if (!user) {
-      return res.status(404).json({ ok: false, error: "Usuario no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "Usuario no encontrado" });
     }
 
     if (name !== undefined) {
@@ -105,7 +120,32 @@ router.put("/:id", authMiddleware, requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al actualizar usuario:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al actualizar usuario" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al actualizar usuario" });
+  }
+});
+
+// Define la ruta para eliminar un usuario
+router.delete("/:id", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const user = await User.findById(id);
+    if (!user) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Usuario no encontrado" });
+    }
+
+    await user.deleteOne();
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Error al eliminar usuario:", error.message);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al eliminar usuario" });
   }
 });
 
