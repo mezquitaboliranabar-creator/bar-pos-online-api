@@ -172,6 +172,62 @@ router.post("/", authMiddleware, async (req, res) => {
   }
 });
 
+// Resumen de reservas activas (consumed=false) por producto en mesas OPEN
+router.get("/reservations/summary", authMiddleware, async (req, res) => {
+  try {
+    const { status = "OPEN" } = req.query;
+
+    const tabCollection = Tab.collection && Tab.collection.name ? Tab.collection.name : "tabs";
+    const desiredStatus = String(status || "OPEN").toUpperCase();
+
+    const pipeline = [
+      { $match: { consumed: false } },
+      {
+        $lookup: {
+          from: tabCollection,
+          localField: "tab",
+          foreignField: "_id",
+          as: "tabDoc",
+        },
+      },
+      { $unwind: "$tabDoc" },
+    ];
+
+    if (desiredStatus && desiredStatus !== "ALL") {
+      pipeline.push({ $match: { "tabDoc.status": desiredStatus } });
+    }
+
+    pipeline.push(
+      {
+        $group: {
+          _id: "$product",
+          reserved_qty: { $sum: "$qty" },
+        },
+      },
+      { $sort: { reserved_qty: -1 } }
+    );
+
+    const rows = await StockReservation.aggregate(pipeline);
+
+    const items = (rows || [])
+      .filter((r) => r && r._id)
+      .map((r) => ({
+        product_id: String(r._id),
+        reserved_qty: Number(r.reserved_qty || 0),
+      }));
+
+    return res.json({
+      ok: true,
+      status: desiredStatus,
+      items,
+      total: items.length,
+    });
+  } catch (error) {
+    console.error("Error al resumir reservas activas:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al resumir reservas activas" });
+  }
+});
+
 // Obtiene el detalle de una mesa con sus ítems
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
