@@ -472,13 +472,7 @@ router.post("/", authMiddleware, async (req, res) => {
   try {
     const user = req.user;
 
-    const {
-      items,
-      payments,
-      notes,
-      client,
-      location,
-    } = req.body || {};
+    const { items, payments, notes, client, location } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "Items requeridos" });
@@ -718,14 +712,7 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
   try {
     const user = req.user;
 
-    const {
-      items,
-      payments,
-      notes,
-      client,
-      tab_id,
-      location,
-    } = req.body || {};
+    const { items, payments, notes, client, tab_id, location } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "Items requeridos" });
@@ -1113,7 +1100,7 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
 // DEVOLUCIONES
 // ============================
 
-// Registra devolución y devuelve stock (compatible con el módulo)
+// Registra devolución y devuelve stock sin modificar el estado de la venta
 async function handleSaleReturn(req, res, saleIdParam) {
   try {
     const user = req.user;
@@ -1121,6 +1108,9 @@ async function handleSaleReturn(req, res, saleIdParam) {
     const {
       sale_id,
       items,
+      sale_item,
+      qty,
+      refund_amount,
       note,
       record_refund_payment = false,
       location,
@@ -1132,7 +1122,15 @@ async function handleSaleReturn(req, res, saleIdParam) {
       return res.status(400).json({ ok: false, error: "sale_id requerido" });
     }
 
-    if (!Array.isArray(items) || items.length === 0) {
+    // Normaliza payload nuevo y legacy
+    let reqItems = [];
+    if (Array.isArray(items) && items.length > 0) {
+      reqItems = items;
+    } else if (sale_item && qty) {
+      reqItems = [{ sale_item_id: sale_item, qty, refund_amount }];
+    }
+
+    if (!Array.isArray(reqItems) || reqItems.length === 0) {
       return res.status(400).json({ ok: false, error: "Items requeridos para devolución" });
     }
 
@@ -1156,15 +1154,17 @@ async function handleSaleReturn(req, res, saleIdParam) {
 
     const saleItemMap = new Map(saleItems.map((si) => [si.id.toString(), si]));
 
+    // Valida items y calcula máximo devolvible
     const normalizedReqItems = [];
-    for (const it of items) {
+    for (const it of reqItems) {
       const saleItemId = it.sale_item_id || it.saleItemId || it.sale_item;
-      const qty = Number(it.qty);
+      const q = Number(it.qty);
+      const ra = it.refund_amount !== undefined && it.refund_amount !== null ? Number(it.refund_amount) : null;
 
       if (!saleItemId) {
         return res.status(400).json({ ok: false, error: "sale_item_id requerido en item" });
       }
-      if (!Number.isFinite(qty) || qty <= 0 || Math.round(qty) !== qty) {
+      if (!Number.isFinite(q) || q <= 0 || Math.round(q) !== q) {
         return res.status(400).json({ ok: false, error: "Cantidad inválida en devolución" });
       }
 
@@ -1176,19 +1176,20 @@ async function handleSaleReturn(req, res, saleIdParam) {
       const already = sumReturnedQtyForItem(existingReturns, si.id);
       const maxQty = Math.max(0, Number(si.qty || 0) - already);
 
-      if (qty > maxQty) {
+      if (q > maxQty) {
         return res.status(400).json({
           ok: false,
           error: "Cantidad de devolución supera disponible",
           sale_item_id: si.id,
-          requested: qty,
+          requested: q,
           available: maxQty,
         });
       }
 
-      normalizedReqItems.push({ si, qty });
+      normalizedReqItems.push({ si, qtyReturn: q, refundOverride: ra });
     }
 
+    // Cache de recetas
     const recipeCache = new Map();
     async function loadRecipeRowsForProduct(prod) {
       const key = prod.id.toString();
@@ -1198,24 +1199,29 @@ async function handleSaleReturn(req, res, saleIdParam) {
       return rows;
     }
 
-    let refundAmount = 0;
+    let refundTotal = 0;
     const returnItems = [];
     const invMovesToCreate = [];
 
     for (const x of normalizedReqItems) {
       const si = x.si;
-      const qtyReturn = x.qty;
+      const qtyReturn = x.qtyReturn;
 
       const prod = si.product;
       if (!prod) {
         return res.status(400).json({ ok: false, error: "Producto no encontrado en item" });
       }
 
+      // Reembolso por item
       const qtyOriginal = Math.max(1, Number(si.qty || 1));
       const unitTotal = Number(si.line_total || 0) / qtyOriginal;
-      const amount = Math.max(0, roundInt(unitTotal * qtyReturn));
 
-      refundAmount += amount;
+      let amount = Math.max(0, roundInt(unitTotal * qtyReturn));
+      if (x.refundOverride !== null && Number.isFinite(x.refundOverride) && x.refundOverride >= 0) {
+        amount = roundInt(x.refundOverride);
+      }
+
+      refundTotal += amount;
 
       returnItems.push({
         sale_item_id: si._id,
@@ -1226,22 +1232,18 @@ async function handleSaleReturn(req, res, saleIdParam) {
         amount,
       });
 
+      // Restock con tipos seguros
       const kind = String(prod.kind || "STANDARD").toUpperCase();
 
       if (kind === "STANDARD") {
-        const conv = toCanonicalQty(prod, qtyReturn, "UNIT");
-        if (!conv.ok) {
-          return res.status(400).json({ ok: false, error: conv.error });
-        }
-
-        prod.stock = Number(prod.stock || 0) + Math.ceil(conv.qty);
+        prod.stock = Number(prod.stock || 0) + qtyReturn;
         await prod.save();
 
         invMovesToCreate.push({
           product: prod._id,
-          qty: Math.ceil(conv.qty),
+          qty: qtyReturn,
           note: `Devolución venta ${sale.id}`,
-          type: "RETURN",
+          type: "IN",
           sourceRef: sale.id.toString(),
           user: user.id,
           location: location || null,
@@ -1257,13 +1259,19 @@ async function handleSaleReturn(req, res, saleIdParam) {
       } else if (kind === "COCKTAIL") {
         const recipeRows = await loadRecipeRowsForProduct(prod);
         if (!recipeRows.length) {
-          return res.status(400).json({ ok: false, error: `El cóctel ${prod.name} no tiene receta` });
+          return res.status(400).json({
+            ok: false,
+            error: `El cóctel ${prod.name} no tiene receta`,
+          });
         }
 
         for (const r of recipeRows) {
           const ing = await Product.findById(r.ingredient);
           if (!ing) {
-            return res.status(400).json({ ok: false, error: `Ingrediente ${r.ingredient.toString()} no existe` });
+            return res.status(400).json({
+              ok: false,
+              error: `Ingrediente ${r.ingredient.toString()} no existe`,
+            });
           }
 
           const conv = recipeQtyToCanonical(ing, r.role, r.qty, r.unit);
@@ -1276,14 +1284,11 @@ async function handleSaleReturn(req, res, saleIdParam) {
           ing.stock = Number(ing.stock || 0) + add;
           await ing.save();
 
-          const role = String(r.role || "BASE").toUpperCase();
-          const mvType = role === "ACCOMP" ? "RETURN_ACCOMP" : "RETURN_RECIPE";
-
           invMovesToCreate.push({
             product: ing._id,
             qty: add,
             note: `Devolución venta ${sale.id}`,
-            type: mvType,
+            type: "IN",
             sourceRef: sale.id.toString(),
             user: user.id,
             location: location || null,
@@ -1298,19 +1303,14 @@ async function handleSaleReturn(req, res, saleIdParam) {
           });
         }
       } else {
-        const conv = toCanonicalQty(prod, qtyReturn, "UNIT");
-        if (!conv.ok) {
-          return res.status(400).json({ ok: false, error: conv.error });
-        }
-
-        prod.stock = Number(prod.stock || 0) + Math.ceil(conv.qty);
+        prod.stock = Number(prod.stock || 0) + qtyReturn;
         await prod.save();
 
         invMovesToCreate.push({
           product: prod._id,
-          qty: Math.ceil(conv.qty),
+          qty: qtyReturn,
           note: `Devolución venta ${sale.id}`,
-          type: "RETURN",
+          type: "IN",
           sourceRef: sale.id.toString(),
           user: user.id,
           location: location || null,
@@ -1330,40 +1330,39 @@ async function handleSaleReturn(req, res, saleIdParam) {
       await InventoryMove.insertMany(invMovesToCreate);
     }
 
-    const doc = await SaleReturn.create({
+    const payload = {
       sale: sale._id,
       user: user.id,
       items: returnItems,
-      amount: Math.max(0, roundInt(refundAmount)),
+      amount: Math.max(0, roundInt(refundTotal)),
       note: note ? String(note).slice(0, 500) : null,
       record_refund_payment: !!record_refund_payment,
-    });
+    };
 
+    // Compatibilidad legacy cuando es 1 item
+    if (normalizedReqItems.length === 1) {
+      payload.sale_item = normalizedReqItems[0].si._id;
+      payload.qty = normalizedReqItems[0].qtyReturn;
+      payload.refund_amount = Math.max(0, roundInt(refundTotal));
+    }
+
+    const doc = await SaleReturn.create(payload);
+
+    // Pago de reembolso sin bloquear devolución
     if (record_refund_payment) {
-      await Payment.create({
-        sale: sale._id,
-        method: "CASH",
-        provider: null,
-        amount: -Math.abs(roundInt(refundAmount)),
-        change_given: 0,
-        reference: "REFUND",
-      });
+      try {
+        await Payment.create({
+          sale: sale._id,
+          method: "CASH",
+          provider: null,
+          amount: -Math.abs(roundInt(refundTotal)),
+          change_given: 0,
+          reference: "REFUND",
+        });
+      } catch (e) {
+        console.error("Error al registrar pago de reembolso:", e.message);
+      }
     }
-
-    const allReturns = await SaleReturn.find({ sale: sale._id });
-    const returnedMap = new Map();
-    for (const si of saleItems) {
-      const already = sumReturnedQtyForItem(allReturns, si.id);
-      returnedMap.set(si.id.toString(), already);
-    }
-
-    const isFullyReturned = saleItems.every((si) => {
-      const r = returnedMap.get(si.id.toString()) || 0;
-      return Number(r) >= Number(si.qty || 0);
-    });
-
-    sale.status = isFullyReturned ? "REFUNDED" : "PARTIAL_REFUND";
-    await sale.save();
 
     return res.status(201).json({
       ok: true,
