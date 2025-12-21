@@ -101,19 +101,19 @@ function toCanonicalQty(prod, qty, unit) {
     if (!Number.isFinite(q) || Math.round(q) !== q) {
       return { ok: false, error: "UNIT requiere enteros" };
     }
-    return { ok: true, qty: q };
+    return { ok: true, qty: q, canon };
   }
 
   if (cat === "VOLUME") {
     const f = VOL_TO_ML[u];
     if (!f) return { ok: false, error: `Unidad volumen inválida: ${u}` };
-    return { ok: true, qty: Math.ceil(q * f) };
+    return { ok: true, qty: Math.ceil(q * f), canon };
   }
 
   if (cat === "MASS") {
     const f = MASS_TO_G[u];
     if (!f) return { ok: false, error: `Unidad masa inválida: ${u}` };
-    return { ok: true, qty: Math.ceil(q * f) };
+    return { ok: true, qty: Math.ceil(q * f), canon };
   }
 
   return { ok: false, error: "Medida no soportada" };
@@ -193,6 +193,30 @@ function recipeQtyToCanonical(ingProd, role, recipeQty, recipeUnit) {
 
   return { ok: false, error: "Canónica no soportada" };
 }
+
+// Suma lo ya devuelto por sale_item considerando nuevo y legacy
+function sumReturnedQtyForItem(returnsDocs, saleItemId) {
+  const key = String(saleItemId);
+  let sum = 0;
+
+  for (const r of returnsDocs || []) {
+    if (Array.isArray(r.items) && r.items.length > 0) {
+      for (const it of r.items) {
+        if (String(it.sale_item_id || "") === key) {
+          sum += Number(it.qty || 0);
+        }
+      }
+    } else if (r.sale_item && String(r.sale_item) === key) {
+      sum += Number(r.qty || 0);
+    }
+  }
+
+  return Math.max(0, sum);
+}
+
+// ============================
+// LISTADO / CATÁLOGO / REPORT
+// ============================
 
 // Lista las ventas con filtros por fecha, estado y usuario
 router.get("/", authMiddleware, async (req, res) => {
@@ -405,6 +429,10 @@ router.get("/report", authMiddleware, async (req, res) => {
   }
 });
 
+// ============================
+// DETALLE
+// ============================
+
 // Obtiene el detalle de una venta con ítems, pagos y devoluciones
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
@@ -434,6 +462,10 @@ router.get("/:id", authMiddleware, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Error al obtener venta" });
   }
 });
+
+// ============================
+// CREAR VENTA
+// ============================
 
 // Crea una nueva venta con ítems, pagos y movimientos de inventario simples
 router.post("/", authMiddleware, async (req, res) => {
@@ -1075,6 +1107,282 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
       .status(500)
       .json({ ok: false, error: "Error al crear venta con recetas" });
   }
+});
+
+// ============================
+// DEVOLUCIONES
+// ============================
+
+// Registra devolución y devuelve stock (compatible con el módulo)
+async function handleSaleReturn(req, res, saleIdParam) {
+  try {
+    const user = req.user;
+
+    const {
+      sale_id,
+      items,
+      note,
+      record_refund_payment = false,
+      location,
+    } = req.body || {};
+
+    const saleId = saleIdParam || sale_id;
+
+    if (!saleId) {
+      return res.status(400).json({ ok: false, error: "sale_id requerido" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, error: "Items requeridos para devolución" });
+    }
+
+    const sale = await Sale.findById(saleId);
+    if (!sale) {
+      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
+    }
+
+    if (String(sale.status || "").toUpperCase() === "VOIDED") {
+      return res.status(400).json({ ok: false, error: "No se puede devolver una venta anulada" });
+    }
+
+    const [saleItems, existingReturns] = await Promise.all([
+      SaleItem.find({ sale: sale._id }).populate("product"),
+      SaleReturn.find({ sale: sale._id }),
+    ]);
+
+    if (!saleItems.length) {
+      return res.status(400).json({ ok: false, error: "Venta sin items" });
+    }
+
+    const saleItemMap = new Map(saleItems.map((si) => [si.id.toString(), si]));
+
+    const normalizedReqItems = [];
+    for (const it of items) {
+      const saleItemId = it.sale_item_id || it.saleItemId || it.sale_item;
+      const qty = Number(it.qty);
+
+      if (!saleItemId) {
+        return res.status(400).json({ ok: false, error: "sale_item_id requerido en item" });
+      }
+      if (!Number.isFinite(qty) || qty <= 0 || Math.round(qty) !== qty) {
+        return res.status(400).json({ ok: false, error: "Cantidad inválida en devolución" });
+      }
+
+      const si = saleItemMap.get(String(saleItemId));
+      if (!si) {
+        return res.status(404).json({ ok: false, error: "SaleItem no encontrado en la venta" });
+      }
+
+      const already = sumReturnedQtyForItem(existingReturns, si.id);
+      const maxQty = Math.max(0, Number(si.qty || 0) - already);
+
+      if (qty > maxQty) {
+        return res.status(400).json({
+          ok: false,
+          error: "Cantidad de devolución supera disponible",
+          sale_item_id: si.id,
+          requested: qty,
+          available: maxQty,
+        });
+      }
+
+      normalizedReqItems.push({ si, qty });
+    }
+
+    const recipeCache = new Map();
+    async function loadRecipeRowsForProduct(prod) {
+      const key = prod.id.toString();
+      if (recipeCache.has(key)) return recipeCache.get(key);
+      const rows = await ProductRecipe.find({ product: prod._id });
+      recipeCache.set(key, rows);
+      return rows;
+    }
+
+    let refundAmount = 0;
+    const returnItems = [];
+    const invMovesToCreate = [];
+
+    for (const x of normalizedReqItems) {
+      const si = x.si;
+      const qtyReturn = x.qty;
+
+      const prod = si.product;
+      if (!prod) {
+        return res.status(400).json({ ok: false, error: "Producto no encontrado en item" });
+      }
+
+      const qtyOriginal = Math.max(1, Number(si.qty || 1));
+      const unitTotal = Number(si.line_total || 0) / qtyOriginal;
+      const amount = Math.max(0, roundInt(unitTotal * qtyReturn));
+
+      refundAmount += amount;
+
+      returnItems.push({
+        sale_item_id: si._id,
+        product_id: prod._id,
+        name_snapshot: si.name_snapshot || prod.name,
+        qty: qtyReturn,
+        unit_total: Math.max(0, roundInt(unitTotal)),
+        amount,
+      });
+
+      const kind = String(prod.kind || "STANDARD").toUpperCase();
+
+      if (kind === "STANDARD") {
+        const conv = toCanonicalQty(prod, qtyReturn, "UNIT");
+        if (!conv.ok) {
+          return res.status(400).json({ ok: false, error: conv.error });
+        }
+
+        prod.stock = Number(prod.stock || 0) + Math.ceil(conv.qty);
+        await prod.save();
+
+        invMovesToCreate.push({
+          product: prod._id,
+          qty: Math.ceil(conv.qty),
+          note: `Devolución venta ${sale.id}`,
+          type: "RETURN",
+          sourceRef: sale.id.toString(),
+          user: user.id,
+          location: location || null,
+          supplierId: null,
+          supplierName: null,
+          invoiceNumber: null,
+          unitCost: null,
+          discount: null,
+          tax: null,
+          lot: null,
+          expiryDate: null,
+        });
+      } else if (kind === "COCKTAIL") {
+        const recipeRows = await loadRecipeRowsForProduct(prod);
+        if (!recipeRows.length) {
+          return res.status(400).json({ ok: false, error: `El cóctel ${prod.name} no tiene receta` });
+        }
+
+        for (const r of recipeRows) {
+          const ing = await Product.findById(r.ingredient);
+          if (!ing) {
+            return res.status(400).json({ ok: false, error: `Ingrediente ${r.ingredient.toString()} no existe` });
+          }
+
+          const conv = recipeQtyToCanonical(ing, r.role, r.qty, r.unit);
+          if (!conv.ok) {
+            return res.status(400).json({ ok: false, error: conv.error });
+          }
+
+          const add = Math.ceil(conv.qty * qtyReturn);
+
+          ing.stock = Number(ing.stock || 0) + add;
+          await ing.save();
+
+          const role = String(r.role || "BASE").toUpperCase();
+          const mvType = role === "ACCOMP" ? "RETURN_ACCOMP" : "RETURN_RECIPE";
+
+          invMovesToCreate.push({
+            product: ing._id,
+            qty: add,
+            note: `Devolución venta ${sale.id}`,
+            type: mvType,
+            sourceRef: sale.id.toString(),
+            user: user.id,
+            location: location || null,
+            supplierId: null,
+            supplierName: null,
+            invoiceNumber: null,
+            unitCost: null,
+            discount: null,
+            tax: null,
+            lot: null,
+            expiryDate: null,
+          });
+        }
+      } else {
+        const conv = toCanonicalQty(prod, qtyReturn, "UNIT");
+        if (!conv.ok) {
+          return res.status(400).json({ ok: false, error: conv.error });
+        }
+
+        prod.stock = Number(prod.stock || 0) + Math.ceil(conv.qty);
+        await prod.save();
+
+        invMovesToCreate.push({
+          product: prod._id,
+          qty: Math.ceil(conv.qty),
+          note: `Devolución venta ${sale.id}`,
+          type: "RETURN",
+          sourceRef: sale.id.toString(),
+          user: user.id,
+          location: location || null,
+          supplierId: null,
+          supplierName: null,
+          invoiceNumber: null,
+          unitCost: null,
+          discount: null,
+          tax: null,
+          lot: null,
+          expiryDate: null,
+        });
+      }
+    }
+
+    if (invMovesToCreate.length > 0) {
+      await InventoryMove.insertMany(invMovesToCreate);
+    }
+
+    const doc = await SaleReturn.create({
+      sale: sale._id,
+      user: user.id,
+      items: returnItems,
+      amount: Math.max(0, roundInt(refundAmount)),
+      note: note ? String(note).slice(0, 500) : null,
+      record_refund_payment: !!record_refund_payment,
+    });
+
+    if (record_refund_payment) {
+      await Payment.create({
+        sale: sale._id,
+        method: "CASH",
+        provider: null,
+        amount: -Math.abs(roundInt(refundAmount)),
+        change_given: 0,
+        reference: "REFUND",
+      });
+    }
+
+    const allReturns = await SaleReturn.find({ sale: sale._id });
+    const returnedMap = new Map();
+    for (const si of saleItems) {
+      const already = sumReturnedQtyForItem(allReturns, si.id);
+      returnedMap.set(si.id.toString(), already);
+    }
+
+    const isFullyReturned = saleItems.every((si) => {
+      const r = returnedMap.get(si.id.toString()) || 0;
+      return Number(r) >= Number(si.qty || 0);
+    });
+
+    sale.status = isFullyReturned ? "REFUNDED" : "PARTIAL_REFUND";
+    await sale.save();
+
+    return res.status(201).json({
+      ok: true,
+      return: doc.toJSON(),
+    });
+  } catch (error) {
+    console.error("Error al registrar devolución:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al registrar devolución" });
+  }
+}
+
+// Endpoint principal usado por el frontend (con sale_id en body)
+router.post("/returns", authMiddleware, async (req, res) => {
+  return handleSaleReturn(req, res, null);
+});
+
+// Endpoint alterno por id en la URL
+router.post("/:id/returns", authMiddleware, async (req, res) => {
+  return handleSaleReturn(req, res, req.params.id);
 });
 
 // Exporta el router configurado para ventas
