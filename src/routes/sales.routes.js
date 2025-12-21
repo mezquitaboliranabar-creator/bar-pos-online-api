@@ -11,97 +11,138 @@ const ProductRecipe = require("../models/ProductRecipe");
 // Crea el router para agrupar las rutas de ventas
 const router = express.Router();
 
+// Valida que el usuario autenticado sea administrador
+function requireAdmin(req, res, next) {
+  const role = String(req?.user?.role || "").toLowerCase();
+  if (role !== "admin") {
+    return res.status(403).json({ ok: false, error: "Solo admin" });
+  }
+  next();
+}
+
+// Normaliza un id a string comparable
+function normId(v) {
+  if (v == null) return "";
+  return String(v);
+}
+
+// Calcula el valor de devolución para un item según la lógica del frontend
+function calcRefundAmountForItem(item, qtyReturn) {
+  const qtySold = Number(item?.qty || 0);
+  const want = Number(qtyReturn || 0);
+
+  if (!Number.isFinite(qtySold) || qtySold <= 0) return { unit_total: 0, amount: 0 };
+  if (!Number.isFinite(want) || want <= 0) return { unit_total: 0, amount: 0 };
+
+  const unit_price = Number(item?.unit_price || 0);
+  const line_discount = Number(item?.line_discount || 0);
+  const tax_rate = Number(item?.tax_rate || 0);
+
+  const unitDisc = line_discount > 0 ? Math.floor(line_discount / qtySold) : 0;
+  const unitBase = Math.max(0, unit_price - unitDisc);
+  const unitTax = Math.round((unitBase * tax_rate) / 100);
+  const unitTotal = unitBase + unitTax;
+
+  return { unit_total: unitTotal, amount: unitTotal * want };
+}
+
 // Redondea un valor numérico a entero
 function roundInt(v) {
   return Math.round(Number(v || 0));
 }
 
-// Calcula totales de línea para un item de venta
-function calcLineTotals(unit_price, qty, line_discount, tax_rate) {
-  const gross = unit_price * qty;
-  const discount = Math.max(0, Number(line_discount || 0));
-  const base = Math.max(0, gross - discount);
-  const rate = typeof tax_rate === "number" ? tax_rate : null;
-  const tax = rate !== null ? roundInt((base * rate) / 100) : 0;
-  const total = base + tax;
-  return { gross, discount, base, tax, total };
+// Convierte un valor a número válido o 0
+function asNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
-// Normaliza un rango de fechas para inicio o fin de día
-function normalizeRangeDate(value, isStart) {
-  if (!value) return null;
-  const s = String(value);
-  if (s.length === 10) {
-    return isStart ? s + " 00:00:00" : s + " 23:59:59";
-  }
-  return s;
+// Normaliza un string de fecha YYYY-MM-DD (sin hora)
+function normalizeRangeDate(s) {
+  const str = String(s || "").trim();
+  if (!str) return null;
+  const m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
-// Obtiene el resumen de pagos agrupado por método y proveedor
-async function aggregatePaymentsSummary(filter) {
-  const pipeline = [
-    { $match: filter },
-    {
-      $group: {
-        _id: { method: "$method", provider: "$provider" },
-        total: { $sum: "$amount" },
-      },
-    },
-    {
-      $project: {
-        _id: 0,
-        method: "$_id.method",
-        provider: "$_id.provider",
-        total: 1,
-      },
-    },
-    { $sort: { method: 1, provider: 1 } },
-  ];
-  const rows = await Payment.aggregate(pipeline);
-  return rows;
+// Retorna el inicio del día local para una fecha YYYY-MM-DD
+function startOfDay(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  return d;
 }
 
-// Mapea el tipo de producto al tipo de inventario
+// Retorna el final del día local para una fecha YYYY-MM-DD
+function endOfDay(dateStr) {
+  const d = new Date(`${dateStr}T23:59:59.999`);
+  return d;
+}
+
+// Mapea kind a inv_type esperado en conversiones
 function mapKindToInvType(kind) {
   const k = String(kind || "").toUpperCase();
   if (k === "BASE") return "BASE";
   if (k === "ACCOMP") return "ACCOMP";
-  return "UNIT";
+  if (k === "COCKTAIL") return "COCKTAIL";
+  return "STANDARD";
 }
 
-// Define la categoría de medida para unidades de inventario
-function measureCategory(measure) {
-  const m = String(measure || "").toUpperCase();
-  if (m === "ML") return "VOLUME";
-  if (m === "G") return "MASS";
-  if (m === "UNIT") return "UNIT";
+// Categoriza la unidad de medida
+function unitCategory(unit) {
+  const u = String(unit || "").toUpperCase();
+  if (["ML", "L", "OZ"].includes(u)) return "VOLUME";
+  if (["G", "KG", "LB"].includes(u)) return "MASS";
+  if (["UNIT"].includes(u)) return "COUNT";
   return null;
 }
 
-// Define tablas de conversión para volumen y masa
-const VOL_TO_ML = { ML: 1, L: 1000, CL: 10, OZ: 29.57, SHOT: 44 };
-const MASS_TO_G = { G: 1, KG: 1000, LB: 453.592 };
+const VOL_TO_ML = {
+  ML: 1,
+  L: 1000,
+  OZ: 29.5735,
+};
 
-// Convierte una cantidad del producto a su unidad canónica de inventario
-function toCanonicalQty(prod, qty, unit) {
+const MASS_TO_G = {
+  G: 1,
+  KG: 1000,
+  LB: 453.592,
+};
+
+// Convierte una cantidad en una unidad a su medida canónica según el producto
+function toCanonicalQty(product, qty, unit) {
+  const invType = mapKindToInvType(product?.kind);
   const q = Number(qty || 0);
-  if (!(q > 0)) return { ok: false, error: "Cantidad inválida" };
+  if (!Number.isFinite(q) || q <= 0) return { ok: false, error: "Cantidad inválida" };
 
-  const invType = mapKindToInvType(prod.kind);
-  let canon = null;
+  const u = String(unit || "").toUpperCase();
+  const cat = unitCategory(u);
 
-  if (invType === "BASE") canon = "ML";
-  if (!canon) canon = invType === "ACCOMP" ? "UNIT" : "UNIT";
+  if (invType === "STANDARD") {
+    const m = String(product?.measure || "UNIT").toUpperCase();
+    const mCat = unitCategory(m);
 
-  const cat = measureCategory(canon);
-  const u = String(unit || canon).toUpperCase();
-
-  if (cat === "UNIT") {
-    if (u !== "UNIT") return { ok: false, error: "Unidad incompatible: UNIT" };
-    if (!Number.isFinite(q) || Math.round(q) !== q) {
-      return { ok: false, error: "UNIT requiere enteros" };
+    if (mCat === "COUNT") {
+      if (cat && cat !== "COUNT") return { ok: false, error: "Unidad inválida para producto" };
+      return { ok: true, qty: Math.ceil(q) };
     }
-    return { ok: true, qty: q };
+
+    if (mCat === "VOLUME") {
+      if (cat !== "VOLUME") return { ok: false, error: "Unidad inválida para volumen" };
+      const f = VOL_TO_ML[u];
+      if (!f) return { ok: false, error: `Unidad volumen inválida: ${u}` };
+      return { ok: true, qty: Math.ceil(q * f) };
+    }
+
+    if (mCat === "MASS") {
+      if (cat !== "MASS") return { ok: false, error: "Unidad inválida para masa" };
+      const f = MASS_TO_G[u];
+      if (!f) return { ok: false, error: `Unidad masa inválida: ${u}` };
+      return { ok: true, qty: Math.ceil(q * f) };
+    }
+  }
+
+  if (cat === "COUNT") {
+    return { ok: true, qty: Math.ceil(q) };
   }
 
   if (cat === "VOLUME") {
@@ -119,429 +160,118 @@ function toCanonicalQty(prod, qty, unit) {
   return { ok: false, error: "Medida no soportada" };
 }
 
-// Convierte cantidad de receta a unidad canónica del ingrediente
-function recipeQtyToCanonical(ingProd, role, recipeQty, recipeUnit) {
-  const r = String(role || "").toUpperCase();
-  const invType = mapKindToInvType(ingProd.kind);
-  const canon =
-    invType === "BASE"
-      ? "ML"
-      : String(ingProd.measure || "").toUpperCase() || "UNIT";
-  const cat = measureCategory(canon);
+// Convierte cantidades de receta a cantidad canónica para el ingrediente
+function recipeQtyToCanonical(ingredientProduct, role, qty, unit) {
+  const ingKind = String(ingredientProduct?.kind || "").toUpperCase();
+  const r = String(role || "BASE").toUpperCase();
 
-  if (r === "BASE") {
-    const u = String(recipeUnit || "ML").toUpperCase();
+  const asRole = r === "ACCOMP" ? "ACCOMP" : "BASE";
+  const invType = ingKind === "ACCOMP" || asRole === "ACCOMP" ? "ACCOMP" : "BASE";
+
+  const q = Number(qty || 0);
+  if (!Number.isFinite(q) || q <= 0) return { ok: false, error: "Cantidad inválida en receta" };
+
+  const u = String(unit || "").toUpperCase();
+  const cat = unitCategory(u);
+
+  if (invType === "BASE") {
+    if (cat !== "VOLUME") return { ok: false, error: "Unidad inválida en receta (BASE)" };
     const f = VOL_TO_ML[u];
-    if (!f) {
-      return {
-        ok: false,
-        error: `Unidad volumen inválida en receta: ${u}`,
-      };
-    }
-    return {
-      ok: true,
-      qty: Math.ceil(Number(recipeQty || 0) * f),
-      canon,
-    };
+    if (!f) return { ok: false, error: `Unidad volumen inválida: ${u}` };
+    return { ok: true, qty: q * f };
   }
 
-  if (cat === "UNIT") {
-    if (String(recipeUnit || "UNIT").toUpperCase() !== "UNIT") {
-      return {
-        ok: false,
-        error: `Acompañamiento ${ingProd.name} usa UNIT`,
-      };
+  if (invType === "ACCOMP") {
+    const m = String(ingredientProduct?.measure || "UNIT").toUpperCase();
+    const mCat = unitCategory(m);
+
+    if (mCat === "COUNT") {
+      if (cat && cat !== "COUNT") return { ok: false, error: "Unidad inválida en receta (ACCOMP)" };
+      return { ok: true, qty: q };
     }
-    const q = Number(recipeQty || 0);
-    if (!(q > 0) || Math.round(q) !== q) {
-      return { ok: false, error: "ACCOMP UNIT requiere enteros" };
+
+    if (mCat === "VOLUME") {
+      if (cat !== "VOLUME") return { ok: false, error: "Unidad inválida en receta (ACCOMP)" };
+      const f = VOL_TO_ML[u];
+      if (!f) return { ok: false, error: `Unidad volumen inválida: ${u}` };
+      return { ok: true, qty: q * f };
     }
-    return { ok: true, qty: q, canon };
+
+    if (mCat === "MASS") {
+      if (cat !== "MASS") return { ok: false, error: "Unidad inválida en receta (ACCOMP)" };
+      const f = MASS_TO_G[u];
+      if (!f) return { ok: false, error: `Unidad masa inválida: ${u}` };
+      return { ok: true, qty: q * f };
+    }
+
+    return { ok: false, error: "Medida de acompañamiento no soportada" };
   }
 
-  if (cat === "VOLUME") {
-    const u = String(recipeUnit || "ML").toUpperCase();
-    const f = VOL_TO_ML[u];
-    if (!f) {
-      return {
-        ok: false,
-        error: `Unidad volumen inválida en receta: ${u}`,
-      };
-    }
-    return {
-      ok: true,
-      qty: Math.ceil(Number(recipeQty || 0) * f),
-      canon,
-    };
-  }
-
-  if (cat === "MASS") {
-    const u = String(recipeUnit || "G").toUpperCase();
-    const f = MASS_TO_G[u];
-    if (!f) {
-      return {
-        ok: false,
-        error: `Unidad masa inválida en receta: ${u}`,
-      };
-    }
-    return {
-      ok: true,
-      qty: Math.ceil(Number(recipeQty || 0) * f),
-      canon,
-    };
-  }
-
-  return { ok: false, error: "Canónica no soportada" };
+  return { ok: false, error: "Tipo de receta no soportado" };
 }
 
-// Lista las ventas con filtros por fecha, estado y usuario
-router.get("/", authMiddleware, async (req, res) => {
-  try {
-    const {
-      start,
-      end,
-      status,
-      user_id,
-      limit = "100",
-      offset = "0",
-    } = req.query;
+// Calcula totales de línea (gross, discount, base, tax, total)
+function calcLineTotals(unit_price, qty, line_discount, tax_rate) {
+  const p = asNumber(unit_price);
+  const q = Math.max(1, Math.round(asNumber(qty)));
+  const disc = Math.max(0, asNumber(line_discount));
+  const tax = Math.max(0, asNumber(tax_rate));
 
-    const filter = {};
-    const and = [];
+  const gross = roundInt(p * q);
+  const discount = roundInt(disc);
+  const base = Math.max(0, gross - discount);
+  const tax_amount = roundInt((base * tax) / 100);
+  const total = base + tax_amount;
 
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
+  return { gross, discount, base, tax: tax_amount, total };
+}
 
-    if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
-    }
-
-    if (status) {
-      and.push({ status: String(status).toUpperCase() });
-    }
-
-    if (user_id) {
-      and.push({ user: user_id });
-    }
-
-    if (and.length > 0) {
-      filter.$and = and;
-    }
-
-    const lim = Math.max(1, Math.min(500, Number(limit) || 100));
-    const off = Math.max(0, Number(offset) || 0);
-
-    const sales = await Sale.find(filter)
-      .populate("user", "username name role")
-      .sort({ createdAt: -1, _id: -1 })
-      .skip(off)
-      .limit(lim);
-
-    const items = sales.map((s) => s.toJSON());
-
-    return res.json({
-      ok: true,
-      items,
-      total: items.length,
-    });
-  } catch (error) {
-    console.error("Error al listar ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al listar ventas" });
-  }
-});
-
-// Obtiene el catálogo de productos para la venta
-router.get("/catalog", authMiddleware, async (req, res) => {
-  try {
-    const { q = "", limit = "500", offset = "0" } = req.query;
-
-    const text = String(q || "").trim().toLowerCase();
-
-    const filter = {
-      is_active: true,
-      kind: { $in: ["STANDARD", "COCKTAIL"] },
-    };
-
-    if (text) {
-      const regex = new RegExp(text, "i");
-      filter.$or = [{ name: regex }, { category: regex }];
-    }
-
-    const lim = Math.max(1, Math.min(1000, Number(limit) || 500));
-    const off = Math.max(0, Number(offset) || 0);
-
-    const products = await Product.find(filter)
-      .sort({ name: 1 })
-      .skip(off)
-      .limit(lim);
-
-    const items = products.map((p) => {
-      const obj = p.toJSON();
-      const stock_available = Math.max(0, Number(obj.stock || 0));
-      return {
-        id: obj.id,
-        name: obj.name,
-        category: obj.category,
-        price: obj.price,
-        stock: obj.stock,
-        min_stock: obj.min_stock,
-        is_active: obj.is_active,
-        kind: obj.kind,
-        inv_type: obj.inv_type,
-        measure: obj.measure,
-        stock_available,
-      };
-    });
-
-    return res.json({
-      ok: true,
-      items,
-      total: items.length,
-    });
-  } catch (error) {
-    console.error("Error al obtener catálogo de ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener catálogo de ventas" });
-  }
-});
-
-// Obtiene el resumen de pagos por método y proveedor
-router.get("/payments/summary", authMiddleware, async (req, res) => {
-  try {
-    const { start, end } = req.query;
-
-    const filter = {};
-    const and = [];
-
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
-
-    if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
-    }
-
-    if (and.length > 0) {
-      filter.$and = and;
-    }
-
-    const items = await aggregatePaymentsSummary(filter);
-
-    return res.json({
-      ok: true,
-      items,
-    });
-  } catch (error) {
-    console.error("Error al obtener resumen de pagos:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener resumen de pagos" });
-  }
-});
-
-// Obtiene un resumen de ventas con totales y ganancia
-router.get("/report", authMiddleware, async (req, res) => {
-  try {
-    const { start, end, status, user_id } = req.query;
-
-    const filter = {};
-    const and = [];
-
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
-
-    if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
-    }
-
-    if (status) {
-      and.push({ status: String(status).toUpperCase() });
-    }
-
-    if (user_id) {
-      and.push({ user: user_id });
-    }
-
-    if (and.length > 0) {
-      filter.$and = and;
-    }
-
-    const sales = await Sale.find(filter);
-
-    const count = sales.length;
-    let sumSubtotal = 0;
-    let sumDiscount = 0;
-    let sumTax = 0;
-    let sumTotal = 0;
-
-    for (const s of sales) {
-      sumSubtotal += Number(s.subtotal || 0);
-      sumDiscount += Number(s.discount_total || 0);
-      sumTax += Number(s.tax_total || 0);
-      sumTotal += Number(s.total || 0);
-    }
-
-    const profit = sumTotal;
-
-    return res.json({
-      ok: true,
-      summary: {
-        count,
-        subtotal: sumSubtotal,
-        discount_total: sumDiscount,
-        tax_total: sumTax,
-        total: sumTotal,
-        profit,
-      },
-    });
-  } catch (error) {
-    console.error("Error al obtener reporte de ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener reporte de ventas" });
-  }
-});
-
-// Obtiene el detalle de una venta con ítems, pagos y devoluciones
-router.get("/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const sale = await Sale.findById(id).populate("user", "username name role");
-
-    if (!sale) {
-      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
-    }
-
-    const [items, payments, returns] = await Promise.all([
-      SaleItem.find({ sale: sale._id }).populate("product"),
-      Payment.find({ sale: sale._id }),
-      SaleReturn.find({ sale: sale._id }),
-    ]);
-
-    return res.json({
-      ok: true,
-      sale: sale.toJSON(),
-      items: items.map((i) => i.toJSON()),
-      payments: payments.map((p) => p.toJSON()),
-      returns: returns.map((r) => r.toJSON()),
-    });
-  } catch (error) {
-    console.error("Error al obtener venta:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener venta" });
-  }
-});
-
-// Crea una nueva venta con ítems, pagos y movimientos de inventario simples
+// Crea una venta (simple)
 router.post("/", authMiddleware, async (req, res) => {
   try {
     const user = req.user;
 
-    const {
-      items,
-      payments,
-      notes,
-      client,
-      location,
-    } = req.body || {};
+    const { items, payments, note, location } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "Items requeridos" });
     }
 
-    if (!Array.isArray(payments) || payments.length === 0) {
-      return res.status(400).json({ ok: false, error: "Pagos requeridos" });
-    }
+    const productIds = items.map((it) => it.product_id).filter(Boolean);
+    const products = await Product.find({ _id: { $in: productIds } });
 
-    const normalizedPayments = [];
-    let paid = 0;
-
-    for (const p of payments) {
-      const method = String(p.method || "").toUpperCase();
-      if (!["CASH", "CARD", "TRANSFER", "OTHER"].includes(method)) {
-        return res.status(400).json({ ok: false, error: "Método de pago inválido" });
-      }
-
-      const amount = Number(p.amount);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ ok: false, error: "Monto de pago inválido" });
-      }
-
-      let provider = null;
-      if (method === "TRANSFER") {
-        const prov = String(p.provider || "").toUpperCase();
-        if (!["NEQUI", "DAVIPLATA"].includes(prov)) {
-          return res.status(400).json({ ok: false, error: "Proveedor de transferencia inválido" });
-        }
-        provider = prov;
-      }
-
-      const reference = p.reference ? String(p.reference) : null;
-
-      normalizedPayments.push({ method, provider, amount, reference });
-      paid += amount;
-    }
-
-    const productIds = items.map((it) => it.productId || it.product_id);
-    const uniqueIds = [...new Set(productIds.filter(Boolean))];
-
-    const products = await Product.find({ _id: { $in: uniqueIds } });
     const productMap = new Map(products.map((p) => [p.id.toString(), p]));
+    const itemRows = [];
 
-    let subtotal = 0;
+    let subtotal_gross = 0;
     let discount_total = 0;
+    let base_total = 0;
     let tax_total = 0;
     let total = 0;
 
-    const itemRows = [];
-
     for (const it of items) {
-      const rawId = it.productId || it.product_id;
-      const qty = Number(it.qty);
+      const pid = String(it.product_id || "");
+      const prod = productMap.get(pid);
 
-      if (!rawId) {
-        return res.status(400).json({ ok: false, error: "Producto inválido en item" });
-      }
-
-      if (!Number.isFinite(qty) || qty <= 0 || Math.round(qty) !== qty) {
-        return res.status(400).json({ ok: false, error: "Cantidad inválida en item" });
-      }
-
-      const prod = productMap.get(String(rawId));
       if (!prod) {
-        return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+        return res.status(400).json({ ok: false, error: "Producto inválido en items" });
       }
 
-      const unit_price =
-        it.unit_price !== undefined && it.unit_price !== null
+      const qty = Math.max(1, Math.round(asNumber(it.qty)));
+      const price =
+        typeof it.unit_price === "number"
           ? Number(it.unit_price)
           : Number(prod.price || 0);
 
-      if (!Number.isFinite(unit_price) || unit_price < 0) {
+      if (!Number.isFinite(price) || price < 0) {
         return res.status(400).json({ ok: false, error: "Precio inválido en item" });
       }
 
-      const line_discount =
-        it.line_discount !== undefined && it.line_discount !== null
-          ? Number(it.line_discount)
-          : 0;
-
-      let tax_rate = null;
-      if (it.tax_rate !== undefined && it.tax_rate !== null) {
-        const tr = Number(it.tax_rate);
-        if (!Number.isNaN(tr)) {
-          tax_rate = tr;
-        }
-      }
-
       const { gross, discount, base, tax, total: line_total } = calcLineTotals(
-        unit_price,
+        price,
         qty,
-        line_discount,
-        tax_rate
+        it.line_discount || 0,
+        it.tax_rate
       );
 
       const available = Number(prod.stock || 0);
@@ -555,67 +285,79 @@ router.post("/", authMiddleware, async (req, res) => {
         });
       }
 
+      prod.stock = available - qty;
+
       itemRows.push({
-        product: prod,
+        product: prod._id,
+        name_snapshot: prod.name,
+        kind_snapshot: prod.kind,
+        measure_snapshot: prod.measure,
         qty,
-        unit_price,
-        line_discount: discount,
-        tax_rate,
-        tax_amount: tax,
-        line_total,
+        unit_price: price,
+        line_discount: roundInt(it.line_discount || 0),
+        tax_rate: roundInt(it.tax_rate || 0),
+        gross,
+        discount,
+        base,
+        tax,
+        total: line_total,
+        added_at: it.added_at ? new Date(it.added_at) : new Date(),
       });
 
-      subtotal += gross - discount;
+      subtotal_gross += gross;
       discount_total += discount;
+      base_total += base;
       tax_total += tax;
       total += line_total;
     }
 
-    if (paid < total) {
-      return res.status(400).json({ ok: false, error: "Pagos insuficientes" });
-    }
+    await Promise.all(products.map((p) => p.save()));
 
     const sale = await Sale.create({
       user: user.id,
+      location: location || null,
+      note: note || null,
       status: "COMPLETED",
-      subtotal,
-      discount_total,
-      tax_total,
-      total,
-      notes: notes || null,
-      client: client || null,
+      subtotal_gross: roundInt(subtotal_gross),
+      discount_total: roundInt(discount_total),
+      base_total: roundInt(base_total),
+      tax_total: roundInt(tax_total),
+      total: roundInt(total),
     });
 
-    for (const r of itemRows) {
-      await SaleItem.create({
+    const createdItems = await SaleItem.insertMany(
+      itemRows.map((r) => ({ ...r, sale: sale._id }))
+    );
+
+    const payRows = Array.isArray(payments) ? payments : [];
+    const createdPays = [];
+
+    for (const p of payRows) {
+      const amount = roundInt(p.amount || 0);
+      if (amount <= 0) continue;
+
+      createdPays.push({
         sale: sale._id,
-        product: r.product._id,
-        qty: r.qty,
-        unit_price: r.unit_price,
-        line_discount: r.line_discount,
-        tax_rate: r.tax_rate,
-        tax_amount: r.tax_amount,
-        line_total: r.line_total,
-        name_snapshot: r.product.name,
-        category_snapshot: r.product.category || null,
+        method: String(p.method || "CASH").toUpperCase(),
+        provider: p.provider ? String(p.provider) : null,
+        amount,
+        change_given: roundInt(p.change_given || 0),
+        reference: p.reference ? String(p.reference) : null,
       });
+    }
 
-      const prod = r.product;
-      const newStock = Number(prod.stock || 0) - r.qty;
-      if (newStock < 0) {
-        throw new Error("Stock negativo al aplicar venta");
-      }
+    if (createdPays.length) {
+      await Payment.insertMany(createdPays);
+    }
 
-      prod.stock = newStock;
-      await prod.save();
-
-      await InventoryMove.create({
-        product: prod._id,
-        qty: -r.qty,
-        note: "Venta " + sale.id,
-        user: user.id,
+    await InventoryMove.insertMany(
+      createdItems.map((it) => ({
+        product: it.product,
+        qty: -Math.abs(Number(it.qty || 0)),
+        note: `Venta ${sale.id}`,
         type: "OUT",
         sourceRef: sale.id.toString(),
+        user: user.id,
         location: location || null,
         supplierId: null,
         supplierName: null,
@@ -625,55 +367,18 @@ router.post("/", authMiddleware, async (req, res) => {
         tax: null,
         lot: null,
         expiryDate: null,
-      });
-    }
-
-    const cashIndexes = normalizedPayments
-      .map((p, i) => ({ i, p }))
-      .filter((x) => x.p.method === "CASH")
-      .map((x) => x.i);
-
-    const overpay = paid - total;
-    let change = 0;
-    if (overpay > 0 && cashIndexes.length > 0) {
-      change = overpay;
-    }
-
-    const paymentsDocs = [];
-
-    normalizedPayments.forEach((p, idx) => {
-      const isLastCash =
-        cashIndexes.length > 0 && idx === cashIndexes[cashIndexes.length - 1];
-      const change_given = isLastCash ? change : 0;
-
-      paymentsDocs.push(
-        new Payment({
-          sale: sale._id,
-          method: p.method,
-          provider: p.provider || null,
-          amount: p.amount,
-          change_given,
-          reference: p.reference || null,
-        })
-      );
-    });
-
-    if (paymentsDocs.length > 0) {
-      await Payment.insertMany(paymentsDocs);
-    }
-
-    const freshSale = await Sale.findById(sale._id).populate(
-      "user",
-      "username name role"
+      }))
     );
-    const freshItems = await SaleItem.find({ sale: sale._id }).populate("product");
-    const freshPayments = await Payment.find({ sale: sale._id });
 
-    return res.status(201).json({
+    const finalSale = await Sale.findById(sale._id).populate("user", "username name role");
+    const finalItems = await SaleItem.find({ sale: sale._id });
+    const finalPays = await Payment.find({ sale: sale._id });
+
+    return res.json({
       ok: true,
-      sale: freshSale.toJSON(),
-      items: freshItems.map((i) => i.toJSON()),
-      payments: freshPayments.map((p) => p.toJSON()),
+      sale: finalSale ? finalSale.toJSON() : sale.toJSON(),
+      items: finalItems.map((i) => i.toJSON()),
+      payments: finalPays.map((p) => p.toJSON()),
     });
   } catch (error) {
     console.error("Error al crear venta:", error.message);
@@ -681,73 +386,29 @@ router.post("/", authMiddleware, async (req, res) => {
   }
 });
 
-// Crea una nueva venta aplicando recetas para cocteles
+// Crea una venta validando recetas de cócteles y consumiendo ingredientes
 router.post("/with-recipes", authMiddleware, async (req, res) => {
   try {
     const user = req.user;
 
-    const {
-      items,
-      payments,
-      notes,
-      client,
-      tab_id,
-      location,
-    } = req.body || {};
+    const { items, payments, note, location } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "Items requeridos" });
     }
 
-    if (!Array.isArray(payments) || payments.length === 0) {
-      return res.status(400).json({ ok: false, error: "Pagos requeridos" });
-    }
+    const normalized = items
+      .map((it) => ({
+        product_id: it.product_id,
+        qty: Math.max(1, Math.round(asNumber(it.qty))),
+        unit_price: typeof it.unit_price === "number" ? Number(it.unit_price) : null,
+        line_discount: roundInt(it.line_discount || 0),
+        tax_rate: roundInt(it.tax_rate || 0),
+        added_at: it.added_at ? new Date(it.added_at) : new Date(),
+      }))
+      .filter((it) => it.product_id);
 
-    const normalizedPayments = [];
-    let paid = 0;
-
-    for (const p of payments) {
-      const method = String(p.method || "").toUpperCase();
-      if (!["CASH", "CARD", "TRANSFER", "OTHER"].includes(method)) {
-        return res.status(400).json({ ok: false, error: "Método de pago inválido" });
-      }
-
-      const amount = Number(p.amount);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ ok: false, error: "Monto de pago inválido" });
-      }
-
-      let provider = null;
-      if (method === "TRANSFER") {
-        const prov = String(p.provider || "").toUpperCase();
-        if (!["NEQUI", "DAVIPLATA"].includes(prov)) {
-          return res.status(400).json({ ok: false, error: "Proveedor de transferencia inválido" });
-        }
-        provider = prov;
-      }
-
-      const reference = p.reference ? String(p.reference) : null;
-
-      normalizedPayments.push({ method, provider, amount, reference });
-      paid += amount;
-    }
-
-    const normalizedItems = items.map((it) => ({
-      productId: it.productId || it.product_id,
-      qty: Number(it.qty),
-      unit_price: it.unit_price,
-      line_discount: it.line_discount || 0,
-      tax_rate: typeof it.tax_rate === "number" ? it.tax_rate : null,
-      note: it.note ? String(it.note).slice(0, 200) : null,
-    }));
-
-    const productIds = normalizedItems.map((it) => it.productId).filter(Boolean);
-    const uniqueIds = [...new Set(productIds.map((id) => String(id)))];
-
-    if (uniqueIds.length === 0) {
-      return res.status(400).json({ ok: false, error: "Productos inválidos en items" });
-    }
-
+    const uniqueIds = [...new Set(normalized.map((it) => String(it.product_id)))];
     const products = await Product.find({ _id: { $in: uniqueIds } });
     const productMap = new Map(products.map((p) => [p.id.toString(), p]));
 
@@ -773,30 +434,21 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
     const invPlan = [];
     const itemRowsTmp = [];
 
-    let subtotal = 0;
+    let subtotal_gross = 0;
     let discount_total = 0;
+    let base_total = 0;
     let tax_total = 0;
     let total = 0;
 
-    for (const it of normalizedItems) {
-      const pid = it.productId;
-      const qty = it.qty;
-
-      if (!pid) {
-        return res.status(400).json({ ok: false, error: "Producto inválido en item" });
-      }
-
-      if (!Number.isFinite(qty) || qty <= 0 || Math.round(qty) !== qty) {
-        return res.status(400).json({ ok: false, error: "Cantidad inválida en item" });
-      }
-
-      const prod = productMap.get(String(pid));
+    for (const it of normalized) {
+      const prod = productMap.get(String(it.product_id));
       if (!prod) {
-        return res.status(404).json({ ok: false, error: "Producto no encontrado" });
+        return res.status(400).json({ ok: false, error: "Producto inválido en items" });
       }
 
+      const qty = Math.max(1, Math.round(asNumber(it.qty)));
       const price =
-        it.unit_price !== undefined && it.unit_price !== null
+        typeof it.unit_price === "number" && Number.isFinite(it.unit_price)
           ? Number(it.unit_price)
           : Number(prod.price || 0);
 
@@ -812,13 +464,6 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
       );
 
       const kind = String(prod.kind || "STANDARD").toUpperCase();
-
-      if (kind === "BASE" || kind === "ACCOMP") {
-        return res.status(400).json({
-          ok: false,
-          error: `No se puede vender ${prod.name}: es un insumo (${kind})`,
-        });
-      }
 
       if (kind === "STANDARD") {
         const available = Number(prod.stock || 0);
@@ -934,53 +579,418 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
 
       await addToInvPlan();
 
-      subtotal += base;
+      itemRowsTmp.push({
+        product: prod._id,
+        name_snapshot: prod.name,
+        kind_snapshot: prod.kind,
+        measure_snapshot: prod.measure,
+        qty,
+        unit_price: price,
+        line_discount: roundInt(it.line_discount || 0),
+        tax_rate: roundInt(it.tax_rate || 0),
+        gross,
+        discount,
+        base,
+        tax,
+        total: line_total,
+        added_at: it.added_at ? new Date(it.added_at) : new Date(),
+      });
+
+      subtotal_gross += gross;
       discount_total += discount;
+      base_total += base;
       tax_total += tax;
       total += line_total;
-
-      itemRowsTmp.push({
-        product: prod,
-        qty_units: qty,
-        unit_price: price,
-        line_discount: discount,
-        tax_rate: it.tax_rate,
-        tax_amount: tax,
-        line_total,
-      });
     }
 
-    if (paid < total) {
-      return res.status(400).json({ ok: false, error: "Pagos insuficientes" });
+    for (const mv of invPlan) {
+      const prod = await Product.findById(mv.productId);
+      if (!prod) {
+        return res.status(400).json({ ok: false, error: "Producto no existe" });
+      }
+
+      const currentStock = Number(prod.stock || 0);
+      const nextStock = currentStock + Number(mv.qty || 0);
+
+      if (nextStock < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Stock insuficiente",
+          product_id: prod.id,
+          requested: Math.abs(Number(mv.qty || 0)),
+          available: currentStock,
+        });
+      }
+
+      prod.stock = nextStock;
+      await prod.save();
     }
 
     const sale = await Sale.create({
       user: user.id,
+      location: location || null,
+      note: note || null,
       status: "COMPLETED",
-      subtotal,
-      discount_total,
-      tax_total,
-      total,
-      notes: notes || null,
-      client: client || null,
+      subtotal_gross: roundInt(subtotal_gross),
+      discount_total: roundInt(discount_total),
+      base_total: roundInt(base_total),
+      tax_total: roundInt(tax_total),
+      total: roundInt(total),
     });
 
-    for (const r of itemRowsTmp) {
-      await SaleItem.create({
+    const createdItems = await SaleItem.insertMany(
+      itemRowsTmp.map((r) => ({ ...r, sale: sale._id }))
+    );
+
+    const payRows = Array.isArray(payments) ? payments : [];
+    const createdPays = [];
+
+    for (const p of payRows) {
+      const amount = roundInt(p.amount || 0);
+      if (amount <= 0) continue;
+
+      createdPays.push({
         sale: sale._id,
-        product: r.product._id,
-        qty: r.qty_units,
-        unit_price: r.unit_price,
-        line_discount: r.line_discount,
-        tax_rate: r.tax_rate,
-        tax_amount: r.tax_amount,
-        line_total: r.line_total,
-        name_snapshot: r.product.name,
-        category_snapshot: r.product.category || null,
+        method: String(p.method || "CASH").toUpperCase(),
+        provider: p.provider ? String(p.provider) : null,
+        amount,
+        change_given: roundInt(p.change_given || 0),
+        reference: p.reference ? String(p.reference) : null,
       });
     }
 
-    const headerNote = `Venta ${sale.id}`;
+    if (createdPays.length) {
+      await Payment.insertMany(createdPays);
+    }
+
+    await InventoryMove.insertMany(
+      invPlan.map((mv) => ({
+        product: mv.productId,
+        qty: Number(mv.qty || 0),
+        note: `Venta ${sale.id}`,
+        type: mv.type,
+        sourceRef: sale.id.toString(),
+        user: user.id,
+        location: location || null,
+        supplierId: null,
+        supplierName: null,
+        invoiceNumber: null,
+        unitCost: null,
+        discount: null,
+        tax: null,
+        lot: null,
+        expiryDate: null,
+      }))
+    );
+
+    const finalSale = await Sale.findById(sale._id).populate("user", "username name role");
+    const finalItems = await SaleItem.find({ sale: sale._id });
+    const finalPays = await Payment.find({ sale: sale._id });
+
+    return res.json({
+      ok: true,
+      sale: finalSale ? finalSale.toJSON() : sale.toJSON(),
+      items: finalItems.map((i) => i.toJSON()),
+      payments: finalPays.map((p) => p.toJSON()),
+    });
+  } catch (error) {
+    console.error("Error al crear venta con recetas:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al crear venta con recetas" });
+  }
+});
+
+// Lista de ventas con filtros (fecha, estado)
+router.get("/", authMiddleware, async (req, res) => {
+  try {
+    const { start, end, status, q } = req.query;
+
+    const startStr = normalizeRangeDate(start);
+    const endStr = normalizeRangeDate(end);
+
+    const filter = {};
+
+    if (startStr || endStr) {
+      filter.createdAt = {};
+      if (startStr) filter.createdAt.$gte = startOfDay(startStr);
+      if (endStr) filter.createdAt.$lte = endOfDay(endStr);
+    }
+
+    if (status && String(status).toUpperCase() !== "ALL") {
+      filter.status = String(status).toUpperCase();
+    }
+
+    if (q) {
+      const s = String(q).trim();
+      if (s) {
+        filter.$or = [
+          { location: { $regex: s, $options: "i" } },
+          { note: { $regex: s, $options: "i" } },
+        ];
+      }
+    }
+
+    const rows = await Sale.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .populate("user", "username name role");
+
+    return res.json({ ok: true, sales: rows.map((r) => r.toJSON()) });
+  } catch (error) {
+    console.error("Error al listar ventas:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al listar ventas" });
+  }
+});
+
+// Reporte de ventas por rango
+router.get("/report", authMiddleware, async (req, res) => {
+  try {
+    const { start, end } = req.query;
+
+    const startStr = normalizeRangeDate(start);
+    const endStr = normalizeRangeDate(end);
+
+    if (!startStr || !endStr) {
+      return res.status(400).json({ ok: false, error: "start y end requeridos" });
+    }
+
+    const from = startOfDay(startStr);
+    const to = endOfDay(endStr);
+
+    const rows = await Sale.find({ createdAt: { $gte: from, $lte: to } })
+      .sort({ createdAt: -1 })
+      .populate("user", "username name role");
+
+    return res.json({ ok: true, sales: rows.map((r) => r.toJSON()) });
+  } catch (error) {
+    console.error("Error al generar reporte:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al generar reporte" });
+  }
+});
+
+// Anula una venta y revierte el stock usando los movimientos asociados
+router.post("/:id/void", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = req.user;
+
+    const sale = await Sale.findById(id);
+    if (!sale) {
+      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
+    }
+
+    const currentStatus = String(sale.status || "").toUpperCase();
+    if (currentStatus === "VOIDED") {
+      return res.json({ ok: true, sale: sale.toJSON() });
+    }
+
+    const returnsCount = await SaleReturn.countDocuments({ sale: sale._id });
+    if (returnsCount > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "No se puede anular una venta con devoluciones",
+      });
+    }
+
+    const sourceRef = sale.id.toString();
+    const moves = await InventoryMove.find({ sourceRef });
+
+    const headerNote = `Anulación venta ${sale.id}`;
+
+    for (const mv of moves) {
+      const prod = await Product.findById(mv.product);
+      if (!prod) continue;
+
+      const delta = -Number(mv.qty || 0);
+      if (!Number.isFinite(delta) || delta === 0) continue;
+
+      const currentStock = Number(prod.stock || 0);
+      prod.stock = currentStock + delta;
+      await prod.save();
+
+      await InventoryMove.create({
+        product: prod._id,
+        qty: delta,
+        note: headerNote,
+        type: "VOID_REVERSAL",
+        sourceRef,
+        user: user.id,
+        location: mv.location || null,
+        supplierId: null,
+        supplierName: null,
+        invoiceNumber: null,
+        unitCost: null,
+        discount: null,
+        tax: null,
+        lot: null,
+        expiryDate: null,
+      });
+    }
+
+    sale.status = "VOIDED";
+    await sale.save();
+
+    return res.json({ ok: true, sale: sale.toJSON() });
+  } catch (error) {
+    console.error("Error al anular venta:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al anular venta" });
+  }
+});
+
+// Registra una devolución parcial o total y ajusta inventario
+async function handleSaleReturn(req, res, saleIdOverride) {
+  try {
+    const user = req.user;
+
+    const { sale_id, items, note, record_refund_payment, location } = req.body || {};
+    const saleId = normId(saleIdOverride || sale_id);
+
+    if (!saleId) {
+      return res.status(400).json({ ok: false, error: "sale_id requerido" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, error: "Items requeridos" });
+    }
+
+    const sale = await Sale.findById(saleId).populate("user", "username name role");
+    if (!sale) {
+      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
+    }
+
+    const st = String(sale.status || "").toUpperCase();
+    if (st === "VOIDED" || st === "REFUNDED") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Estado de venta no permite devolución" });
+    }
+
+    const saleItems = await SaleItem.find({ sale: sale._id }).populate("product");
+    const existingReturns = await SaleReturn.find({ sale: sale._id });
+
+    const returnedByItem = {};
+    for (const r of existingReturns) {
+      const arr = Array.isArray(r.items) ? r.items : [];
+      if (arr.length > 0) {
+        for (const it of arr) {
+          const k = normId(
+            it.sale_item_id ||
+              it.saleItemId ||
+              it.sale_item ||
+              it.saleItem ||
+              it.sale_item_id
+          );
+          const q = Number(it.qty || 0);
+          if (!k || !Number.isFinite(q) || q <= 0) continue;
+          returnedByItem[k] = (returnedByItem[k] || 0) + q;
+        }
+      } else {
+        const k = normId(r.sale_item_id || r.saleItemId || r.sale_item || r.saleItem);
+        const q = Number(r.qty || 0);
+        if (k && Number.isFinite(q) && q > 0) {
+          returnedByItem[k] = (returnedByItem[k] || 0) + q;
+        }
+      }
+    }
+
+    const itemMap = new Map(saleItems.map((it) => [normId(it.id), it]));
+
+    const normalizedLines = [];
+    for (const raw of items) {
+      const sid = normId(raw.sale_item_id || raw.saleItemId || raw.sale_item || raw.saleItem);
+      const want = Math.max(0, Math.floor(Number(raw.qty || 0)));
+      if (!sid || want <= 0) continue;
+
+      const si = itemMap.get(sid);
+      if (!si) {
+        return res.status(400).json({ ok: false, error: `sale_item_id inválido: ${sid}` });
+      }
+
+      const sold = Number(si.qty || 0);
+      const already = Number(returnedByItem[sid] || 0);
+      const remaining = Math.max(0, sold - already);
+
+      if (want > remaining) {
+        return res.status(400).json({
+          ok: false,
+          error: `Cantidad a devolver excede disponible para item ${sid}`,
+        });
+      }
+
+      normalizedLines.push({ sid, want, saleItem: si });
+    }
+
+    if (normalizedLines.length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para devolver" });
+    }
+
+    const invPlan = [];
+    const retItemsForDoc = [];
+
+    let refundAmount = 0;
+
+    for (const line of normalizedLines) {
+      const si = line.saleItem;
+      const prod = si.product;
+
+      const refund = calcRefundAmountForItem(si, line.want);
+      refundAmount += refund.amount;
+
+      retItemsForDoc.push({
+        sale_item_id: normId(si.id),
+        product_id: prod ? normId(prod.id) : null,
+        name_snapshot: si.name_snapshot || null,
+        qty: line.want,
+        unit_total: refund.unit_total,
+        amount: refund.amount,
+      });
+
+      if (prod && String(prod.kind || "STANDARD").toUpperCase() === "COCKTAIL") {
+        const recipeRows = await ProductRecipe.find({ product: prod._id });
+        if (recipeRows.length > 0) {
+          for (const r of recipeRows) {
+            const ing = await Product.findById(r.ingredient);
+            if (!ing) {
+              return res.status(400).json({
+                ok: false,
+                error: `Ingrediente ${r.ingredient.toString()} no existe`,
+              });
+            }
+            const conv = recipeQtyToCanonical(ing, r.role, r.qty, r.unit);
+            if (!conv.ok) {
+              return res.status(400).json({ ok: false, error: conv.error });
+            }
+            const need = Math.ceil(conv.qty * Math.max(1, Math.round(line.want)));
+            const moveType =
+              String(r.role || "BASE").toUpperCase() === "ACCOMP"
+                ? "RETURN_ACCOMP"
+                : "RETURN_RECIPE";
+
+            invPlan.push({
+              productId: ing._id,
+              qty: need,
+              type: moveType,
+              label: ing.name,
+            });
+          }
+          continue;
+        }
+      }
+
+      if (prod) {
+        const conv = toCanonicalQty(prod, line.want, prod.measure || "UNIT");
+        if (!conv.ok) {
+          return res.status(400).json({ ok: false, error: conv.error });
+        }
+        invPlan.push({
+          productId: prod._id,
+          qty: Math.ceil(conv.qty),
+          type: "RETURN",
+          label: prod.name,
+        });
+      }
+    }
+
+    const headerNote = `Devolución venta ${sale.id}`;
 
     for (const mv of invPlan) {
       const prod = await Product.findById(mv.productId);
@@ -992,20 +1002,14 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
       }
 
       const currentStock = Number(prod.stock || 0);
-      const nextStock = currentStock + mv.qty;
-      if (nextStock < 0) {
-        return res.status(400).json({
-          ok: false,
-          error: `Stock negativo para ${prod.name}`,
-        });
-      }
+      const nextStock = currentStock + Number(mv.qty || 0);
 
       prod.stock = nextStock;
       await prod.save();
 
       await InventoryMove.create({
         product: prod._id,
-        qty: mv.qty,
+        qty: Number(mv.qty || 0),
         note: headerNote,
         type: mv.type,
         sourceRef: sale.id.toString(),
@@ -1022,62 +1026,90 @@ router.post("/with-recipes", authMiddleware, async (req, res) => {
       });
     }
 
-    const cashIndexes = normalizedPayments
-      .map((p, i) => ({ i, p }))
-      .filter((x) => x.p.method === "CASH")
-      .map((x) => x.i);
-
-    const overpay = paid - total;
-    let change = 0;
-    if (overpay > 0 && cashIndexes.length > 0) {
-      change = overpay;
-    }
-
-    const paymentsDocs = [];
-
-    normalizedPayments.forEach((p, idx) => {
-      const isLastCash =
-        cashIndexes.length > 0 && idx === cashIndexes[cashIndexes.length - 1];
-      const change_given = isLastCash ? change : 0;
-
-      paymentsDocs.push(
-        new Payment({
-          sale: sale._id,
-          method: p.method,
-          provider: p.provider || null,
-          amount: p.amount,
-          change_given,
-          reference: p.reference || null,
-        })
-      );
+    const saleReturn = await SaleReturn.create({
+      sale: sale._id,
+      user: user.id,
+      note: note || null,
+      items: retItemsForDoc,
+      amount: refundAmount,
+      record_refund_payment: !!record_refund_payment,
     });
 
-    if (paymentsDocs.length > 0) {
-      await Payment.insertMany(paymentsDocs);
+    if (record_refund_payment) {
+      await Payment.create({
+        sale: sale._id,
+        method: "CASH",
+        provider: null,
+        amount: -Math.abs(refundAmount),
+        change_given: 0,
+        reference: "REFUND",
+      });
     }
 
-    const freshSale = await Sale.findById(sale._id).populate(
-      "user",
-      "username name role"
-    );
-    const freshItems = await SaleItem.find({ sale: sale._id }).populate("product");
-    const freshPayments = await Payment.find({ sale: sale._id });
+    const returnedByItemNext = { ...returnedByItem };
+    for (const line of normalizedLines) {
+      returnedByItemNext[line.sid] = (returnedByItemNext[line.sid] || 0) + line.want;
+    }
 
-    return res.status(201).json({
+    const fullyReturned = saleItems.every((it) => {
+      const sold = Number(it.qty || 0);
+      const done = Number(returnedByItemNext[normId(it.id)] || 0);
+      return sold > 0 ? done >= sold : true;
+    });
+
+    if (fullyReturned) {
+      sale.status = "REFUNDED";
+      await sale.save();
+    }
+
+    const freshReturns = await SaleReturn.find({ sale: sale._id });
+
+    return res.json({
       ok: true,
-      sale: freshSale.toJSON(),
-      items: freshItems.map((i) => i.toJSON()),
-      payments: freshPayments.map((p) => p.toJSON()),
+      sale: sale.toJSON(),
+      returns: freshReturns.map((r) => r.toJSON()),
+      refund_amount: refundAmount,
+      return: saleReturn.toJSON(),
     });
   } catch (error) {
-    console.error("Error al crear venta con recetas:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al crear venta con recetas" });
+    console.error("Error al registrar devolución:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al registrar devolución" });
+  }
+}
+
+router.post("/returns", authMiddleware, requireAdmin, async (req, res) => {
+  return handleSaleReturn(req, res, null);
+});
+
+router.post("/:id/returns", authMiddleware, requireAdmin, async (req, res) => {
+  return handleSaleReturn(req, res, req.params.id);
+});
+
+// Obtiene el detalle de una venta con ítems, pagos y devoluciones
+router.get("/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const sale = await Sale.findById(id).populate("user", "username name role");
+    if (!sale) {
+      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
+    }
+
+    const items = await SaleItem.find({ sale: sale._id });
+    const payments = await Payment.find({ sale: sale._id });
+    const returns = await SaleReturn.find({ sale: sale._id });
+
+    return res.json({
+      ok: true,
+      sale: sale.toJSON(),
+      items: items.map((i) => i.toJSON()),
+      payments: payments.map((p) => p.toJSON()),
+      returns: returns.map((r) => r.toJSON()),
+    });
+  } catch (error) {
+    console.error("Error al obtener detalle de venta:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al obtener detalle de venta" });
   }
 });
 
-// Exporta el router configurado para ventas
-module.exports = {
-  salesRouter: router,
-};
+module.exports = router;
