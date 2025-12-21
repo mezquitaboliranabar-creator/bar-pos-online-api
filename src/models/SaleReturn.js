@@ -1,6 +1,43 @@
 const mongoose = require("mongoose");
 
-// Define el esquema de devolución con referencia a venta e ítem de venta
+/* Items devueltos (nuevo esquema) */
+const saleReturnItemSchema = new mongoose.Schema(
+  {
+    sale_item_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SaleItem",
+      default: null,
+    },
+    product_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+      default: null,
+    },
+    name_snapshot: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    qty: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
+    unit_total: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    amount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+  },
+  { _id: false }
+);
+
+/* Define el esquema de devolución (compatible con legacy y nuevo) */
 const saleReturnSchema = new mongoose.Schema(
   {
     sale: {
@@ -8,25 +45,43 @@ const saleReturnSchema = new mongoose.Schema(
       ref: "Sale",
       required: true,
     },
-    sale_item: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "SaleItem",
-      required: true,
+
+    /* Nuevo formato */
+    items: {
+      type: [saleReturnItemSchema],
+      default: [],
     },
-    qty: {
+    amount: {
       type: Number,
-      required: true,
-      min: 1,
-    },
-    refund_amount: {
-      type: Number,
-      required: true,
+      default: 0,
       min: 0,
     },
+    record_refund_payment: {
+      type: Boolean,
+      default: false,
+    },
+
     note: {
       type: String,
       default: null,
       trim: true,
+    },
+
+    /* Campos legacy (ya no requeridos) */
+    sale_item: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SaleItem",
+      default: null,
+    },
+    qty: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    refund_amount: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
   },
   {
@@ -37,11 +92,12 @@ const saleReturnSchema = new mongoose.Schema(
   }
 );
 
-// Define índices para optimizar consultas por venta e ítem de venta
+/* Índices */
 saleReturnSchema.index({ sale: 1 });
 saleReturnSchema.index({ sale_item: 1 });
+saleReturnSchema.index({ "items.sale_item_id": 1 });
 
-// Configura la salida JSON para normalizar el identificador y ocultar campos internos
+/* Normaliza salida JSON */
 saleReturnSchema.set("toJSON", {
   transform(_doc, ret) {
     ret.id = ret._id.toString();
@@ -51,7 +107,7 @@ saleReturnSchema.set("toJSON", {
   },
 });
 
-// Crea y exporta el modelo SaleReturn basado en el esquema definido
+/* Modelo */
 const SaleReturn = mongoose.model("SaleReturn", saleReturnSchema);
 
 module.exports = SaleReturn;
