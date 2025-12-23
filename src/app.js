@@ -28,6 +28,7 @@ const app = express();
 // Define orígenes permitidos para CORS
 const allowedOrigins = [
   "http://localhost:3000",
+  "https://bar-pos-online-frontend.vercel.app", 
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
