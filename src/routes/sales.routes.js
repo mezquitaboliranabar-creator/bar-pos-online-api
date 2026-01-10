@@ -12,284 +12,179 @@ const Expense = require("../models/Expense");
 // Crea el router para agrupar las rutas de ventas
 const router = express.Router();
 
+// Verifica si un modelo tiene un campo en el schema
+function hasSchemaPath(Model, path) {
+  return Boolean(
+    Model &&
+      Model.schema &&
+      typeof Model.schema.path === "function" &&
+      Model.schema.path(path)
+  );
+}
+
+// Asigna referencia de venta usando los campos disponibles
+function attachSaleRef(doc, sale, Model) {
+  const saleObjId = sale?._id || sale?.id;
+  const saleStr = String(sale?.id || saleObjId || "");
+
+  if (hasSchemaPath(Model, "sale")) doc.sale = saleObjId;
+  if (hasSchemaPath(Model, "sale_id")) doc.sale_id = saleStr;
+
+  if (!hasSchemaPath(Model, "sale") && !hasSchemaPath(Model, "sale_id")) {
+    doc.sale_id = saleStr;
+  }
+}
+
 // Redondea un valor numérico a entero
 function roundInt(v) {
   return Math.round(Number(v || 0));
 }
 
-// Calcula totales de línea para un item de venta
-function calcLineTotals(unit_price, qty, line_discount, tax_rate) {
-  const gross = unit_price * qty;
-  const discount = Math.min(Math.max(line_discount || 0, 0), gross);
-  const net = gross - discount;
-  const tax = net * (tax_rate || 0);
-  const total = net + tax;
-
-  return {
-    gross,
-    discount,
-    net,
-    tax,
-    total,
-  };
-}
-
-// Normaliza fecha yyyy-mm-dd a rango completo del día
+// Normaliza un string de fecha para rango (ISO)
 function normalizeRangeDate(value, isStart) {
-  if (!value) return null;
-  const s = String(value);
-  if (s.length === 10) {
-    return isStart ? s + " 00:00:00" : s + " 23:59:59";
-  }
-  return s;
-}
+  const s = String(value || "").trim();
+  if (!s) return null;
 
-// Obtiene el resumen de pagos agrupado por método y proveedor
-async function aggregatePaymentsSummary(filter) {
-  const pipeline = [
-    { $match: filter },
-    {
-      $group: {
-        _id: { method: "$method", provider: "$provider" },
-        total: { $sum: "$amount" },
-      },
-    },
-    {
-      $project: {
-        _id: 0,
-        method: "$_id.method",
-        provider: "$_id.provider",
-        total: 1,
-      },
-    },
-    { $sort: { method: 1, provider: 1 } },
-  ];
-
-  const rows = await Payment.aggregate(pipeline);
-  return rows;
-}
-
-// Obtiene el resumen de gastos agrupado por método y proveedor
-async function aggregateExpensesSummary(filter) {
-  const match = { ...filter };
-
-  if (Array.isArray(match.$and)) {
-    match.$and = [...match.$and, { status: "ACTIVE" }];
-  } else {
-    match.status = "ACTIVE";
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
   }
 
-  const pipeline = [
-    { $match: match },
-    {
-      $group: {
-        _id: { method: "$method", provider: "$provider" },
-        total: { $sum: "$amount" },
-      },
-    },
-    {
-      $project: {
-        _id: 0,
-        method: "$_id.method",
-        provider: "$_id.provider",
-        total: 1,
-      },
-    },
-    { $sort: { method: 1, provider: 1 } },
-  ];
-
-  const rows = await Expense.aggregate(pipeline);
-  return rows;
-}
-
-// Crea un item de venta a partir de un producto
-function buildSaleItemFromProduct(product, qty, line_discount_pct, line_tax_pct) {
-  const unit_price = Number(product.price || 0);
-  const q = Math.max(1, Number(qty || 1));
-  const gross = unit_price * q;
-
-  const pct = Math.max(0, Math.min(100, Number(line_discount_pct || 0)));
-  const line_discount = (gross * pct) / 100;
-
-  const taxRate = Math.max(0, Number(line_tax_pct || 0)) / 100;
-
-  const totals = calcLineTotals(unit_price, q, line_discount, taxRate);
-
-  return {
-    product_id: product.id,
-    productId: product.id,
-    name: product.name,
-    qty: q,
-    unit_price: unit_price,
-    line_discount: roundInt(totals.discount),
-    tax_rate: Number(line_tax_pct || 0),
-    gross: roundInt(totals.gross),
-    net: roundInt(totals.net),
-    tax: roundInt(totals.tax),
-    total: roundInt(totals.total),
-  };
-}
-
-// Crea una venta normalizada desde request
-async function buildSalePayload(reqBody) {
-  const items = Array.isArray(reqBody.items) ? reqBody.items : [];
-  const payments = Array.isArray(reqBody.payments) ? reqBody.payments : [];
-  const status = reqBody.status ? String(reqBody.status).toUpperCase() : "PAID";
-
-  const normalizedItems = [];
-  let subtotal = 0;
-  let discount_total = 0;
-  let tax_total = 0;
-  let total = 0;
-
-  for (const it of items) {
-    const productId = it.productId || it.product_id || it.product;
-    const qty = it.qty || it.quantity || 1;
-
-    const product = await Product.findById(productId);
-    if (!product) {
-      const err = new Error("Producto no encontrado");
-      err.status = 400;
-      throw err;
-    }
-
-    const line_discount_pct = it.line_discount_pct ?? it.discount_pct ?? 0;
-    const line_tax_pct = it.line_tax_pct ?? it.tax_pct ?? 0;
-
-    const saleItem = buildSaleItemFromProduct(product, qty, line_discount_pct, line_tax_pct);
-
-    normalizedItems.push(saleItem);
-
-    subtotal += Number(saleItem.net || 0);
-    discount_total += Number(saleItem.line_discount || 0);
-    tax_total += Number(saleItem.tax || 0);
-    total += Number(saleItem.total || 0);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const t = isStart ? "00:00:00.000Z" : "23:59:59.999Z";
+    return `${s}T${t}`;
   }
 
-  const normalizedPayments = [];
-  let paid = 0;
-
-  for (const p of payments) {
-    const method = String(p.method || "").toUpperCase();
-    const provider = p.provider ? String(p.provider).toUpperCase() : null;
-    const reference = p.reference ? String(p.reference).trim() : null;
-    const amount = roundInt(p.amount);
-
-    normalizedPayments.push({ method, provider, amount, reference });
-    paid += amount;
-  }
-
-  return {
-    status,
-    subtotal: roundInt(subtotal),
-    discount_total: roundInt(discount_total),
-    tax_total: roundInt(tax_total),
-    total: roundInt(total),
-    paid: roundInt(paid),
-    change: roundInt(paid - total),
-    items: normalizedItems,
-    payments: normalizedPayments,
-  };
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
 
-// Obtiene los ids de productos únicos de una lista de items
+// Convierte a número seguro
+function toNumber(v, def = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return n;
+}
+
+// Convierte a entero seguro
+function toInt(v, def = 0) {
+  const n = Math.trunc(Number(v));
+  if (!Number.isFinite(n)) return def;
+  return n;
+}
+
+// Valida array no vacío
+function ensureArray(a) {
+  return Array.isArray(a) ? a : [];
+}
+
+// Extrae ids únicos de productos de items
 function collectUniqueProductIds(items) {
-  const ids = [];
-  for (const it of items) {
-    const pid = it.productId || it.product_id || it.product;
-    if (pid) ids.push(String(pid));
+  const ids = new Set();
+  for (const it of ensureArray(items)) {
+    const id = it.productId || it.product_id || it.product;
+    if (id) ids.add(String(id));
   }
-  return [...new Set(ids)];
+  return Array.from(ids);
 }
 
-// Rellena mapa de productos por id para acceso rápido
-async function buildProductsMap(ids) {
-  const products = await Product.find({ _id: { $in: ids } });
-  return new Map(products.map((p) => [p.id.toString(), p]));
+// Construye mapa de productos por id
+async function buildProductsMap(productIds) {
+  if (!productIds || productIds.length === 0) return new Map();
+  const products = await Product.find({ _id: { $in: productIds } });
+  const map = new Map();
+  for (const p of products) map.set(String(p._id), p);
+  return map;
 }
 
-// Obtiene recetas por producto si aplica
+// Construye mapa de recetas por id producto
 async function buildRecipeMap(productIds) {
-  const recipes = await ProductRecipe.find({ product_id: { $in: productIds } });
+  if (!productIds || productIds.length === 0) return new Map();
+  const recipes = await ProductRecipe.find({ product: { $in: productIds } });
   const map = new Map();
   for (const r of recipes) {
-    const k = String(r.product_id);
-    map.set(k, r);
+    const k = String(r.product);
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(r);
   }
   return map;
 }
 
-// Valida disponibilidad de ingredientes según receta
+// Valida stock por receta (si aplica)
 async function validateRecipeStock(productMap, recipeMap, items) {
-  for (const it of items) {
-    const pid = it.productId || it.product_id || it.product;
-    const key = String(pid || "");
-    const recipe = recipeMap.get(key);
-    if (!recipe) continue;
+  const list = ensureArray(items);
 
-    const qty = Number(it.qty || it.quantity || 1);
-    const ingredients = Array.isArray(recipe.items) ? recipe.items : [];
+  for (const it of list) {
+    const productId = String(it.productId || it.product_id || it.product || "");
+    const qty = toInt(it.qty, 1);
 
-    for (const ing of ingredients) {
-      const ingredientProductId = ing.product_id || ing.productId || ing.product;
-      if (!ingredientProductId) continue;
+    if (!productId) continue;
 
-      const ingredient = productMap.get(String(ingredientProductId));
-      if (!ingredient) continue;
+    const product = productMap.get(productId);
+    const recipes = recipeMap.get(productId) || [];
 
-      const need = Number(ing.qty || 0) * qty;
-      const stock = Number(ingredient.stock || 0);
+    if (!product) continue;
 
-      if (stock < need) {
-        const err = new Error("Stock insuficiente para preparar el producto");
-        err.status = 400;
-        throw err;
+    if (recipes.length === 0) {
+      const stock = toNumber(product.stock, 0);
+      if (stock < qty) {
+        throw new Error(`Stock insuficiente para ${product.name || "producto"} (${stock})`);
+      }
+      continue;
+    }
+
+    // Si hay receta, validar insumos
+    for (const r of recipes) {
+      const ing = await Product.findById(r.ingredient);
+      if (!ing) continue;
+
+      const need = toNumber(r.qty, 0) * qty;
+      const have = toNumber(ing.stock, 0);
+
+      if (have < need) {
+        throw new Error(`Stock insuficiente de insumo ${ing.name || "ingrediente"} (${have})`);
       }
     }
   }
 }
 
-// Aplica movimientos de inventario (salida) para una venta
-async function applyInventoryOutForSale(sale, productMap, recipeMap) {
+// Crea movimientos de inventario por receta o producto directo
+async function createInventoryMovesForSale(sale, productMap, recipeMap, items) {
   const moves = [];
+  const list = ensureArray(items);
 
-  for (const it of sale.items || []) {
-    const pid = it.productId || it.product_id || it.product;
-    const key = String(pid || "");
-    const recipe = recipeMap.get(key);
+  for (const it of list) {
+    const productId = String(it.productId || it.product_id || it.product || "");
+    const qty = toInt(it.qty, 1);
+    if (!productId) continue;
 
-    if (!recipe) {
-      const product = productMap.get(key);
-      if (!product) continue;
+    const product = productMap.get(productId);
+    const recipes = recipeMap.get(productId) || [];
 
+    if (!product) continue;
+
+    if (recipes.length === 0) {
       moves.push({
         type: "OUT",
-        product_id: product.id,
-        qty: Number(it.qty || 1),
+        reason: "SALE",
+        product: product._id,
+        qty: qty,
         note: `Venta ${sale.id}`,
-        sale_id: sale.id,
+        ref: { sale_id: sale.id },
       });
-
       continue;
     }
 
-    const ingredients = Array.isArray(recipe.items) ? recipe.items : [];
-    for (const ing of ingredients) {
-      const ingredientProductId = ing.product_id || ing.productId || ing.product;
-      if (!ingredientProductId) continue;
-
-      const ingKey = String(ingredientProductId);
-      const ingredient = productMap.get(ingKey);
-      if (!ingredient) continue;
-
-      const need = Number(ing.qty || 0) * Number(it.qty || 1);
-
+    for (const r of recipes) {
       moves.push({
         type: "OUT",
-        product_id: ingredient.id,
-        qty: need,
-        note: `Venta ${sale.id} (receta)`,
-        sale_id: sale.id,
+        reason: "SALE_RECIPE",
+        product: r.ingredient,
+        qty: roundInt(toNumber(r.qty, 0) * qty),
+        note: `Venta ${sale.id} (${product.name || "producto"})`,
+        ref: { sale_id: sale.id },
       });
     }
   }
@@ -304,15 +199,16 @@ async function applyInventoryOutForSale(sale, productMap, recipeMap) {
 async function createPaymentsForSale(sale, payments) {
   const docs = [];
   for (const p of payments || []) {
-    docs.push({
-      sale_id: sale.id,
+    const doc = {
       method: p.method,
       provider: p.provider || null,
       reference: p.reference || null,
       amount: roundInt(p.amount),
-    });
-  }
+    };
 
+    attachSaleRef(doc, sale, Payment);
+    docs.push(doc);
+  }
   if (docs.length === 0) return [];
 
   const created = await Payment.insertMany(docs, { ordered: true });
@@ -323,8 +219,7 @@ async function createPaymentsForSale(sale, payments) {
 async function createItemsForSale(sale, items) {
   const docs = [];
   for (const it of items || []) {
-    docs.push({
-      sale_id: sale.id,
+    const doc = {
       product_id: it.productId || it.product_id || it.product,
       name: it.name,
       qty: Number(it.qty || 1),
@@ -335,7 +230,10 @@ async function createItemsForSale(sale, items) {
       net: roundInt(it.net),
       tax: roundInt(it.tax),
       total: roundInt(it.total),
-    });
+    };
+
+    attachSaleRef(doc, sale, SaleItem);
+    docs.push(doc);
   }
 
   if (docs.length === 0) return [];
@@ -347,193 +245,58 @@ async function createItemsForSale(sale, items) {
 // Obtiene catálogo de ventas
 router.get("/catalog", authMiddleware, async (req, res) => {
   try {
-    const products = await Product.find({ active: true }).sort({ name: 1 });
-    return res.json({ ok: true, items: products.map((p) => p.toJSON()) });
+    const products = await Product.find({ active: { $ne: false } }).sort({ name: 1 });
+    const expenses = await Expense.find({ active: { $ne: false } }).sort({ name: 1 });
+
+    return res.json({
+      ok: true,
+      products: products.map((p) => p.toJSON()),
+      expenses: expenses.map((e) => e.toJSON()),
+    });
   } catch (error) {
-    console.error("Error al obtener catálogo de ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener catálogo de ventas" });
+    console.error("Error al obtener catálogo:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al obtener catálogo" });
   }
 });
 
-// Obtiene el resumen de pagos por método y proveedor
-router.get("/payments/summary", authMiddleware, async (req, res) => {
+// Resume pagos por rango
+router.get("/paymentsSummary", authMiddleware, async (req, res) => {
   try {
     const { start, end } = req.query;
 
-    const filter = {};
-    const and = [];
-
     const startNorm = normalizeRangeDate(start, true);
     const endNorm = normalizeRangeDate(end, false);
 
-    if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
-    }
-
-    if (and.length > 0) {
-      filter.$and = and;
-    }
-
-    const [items, expenses_items] = await Promise.all([
-      aggregatePaymentsSummary(filter),
-      aggregateExpensesSummary(filter),
-    ]);
-
-    // Calcula neto por método y proveedor (pagos - gastos)
-    const payMap = new Map();
-    for (const r of items || []) {
-      const key = `${r.method || ""}::${r.provider || ""}`;
-      payMap.set(key, Number(r.total || 0));
-    }
-
-    const expMap = new Map();
-    for (const r of expenses_items || []) {
-      const key = `${r.method || ""}::${r.provider || ""}`;
-      expMap.set(key, Number(r.total || 0));
-    }
-
-    const keys = new Set([...payMap.keys(), ...expMap.keys()]);
-    const net_items = [];
-
-    for (const k of keys) {
-      const parts = k.split("::");
-      const method = parts[0] || "";
-      const provider = parts[1] ? parts[1] : null;
-
-      const payTotal = Number(payMap.get(k) || 0);
-      const expTotal = Number(expMap.get(k) || 0);
-
-      net_items.push({
-        method,
-        provider,
-        total: payTotal - expTotal,
-      });
-    }
-
-    net_items.sort((a, b) => {
-      const am = String(a.method || "");
-      const bm = String(b.method || "");
-      if (am !== bm) return am.localeCompare(bm);
-      const ap = String(a.provider || "");
-      const bp = String(b.provider || "");
-      return ap.localeCompare(bp);
-    });
-
-    return res.json({
-      ok: true,
-      items,
-      expenses_items,
-      net_items,
-    });
-  } catch (error) {
-    console.error("Error al obtener resumen de pagos:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener resumen de pagos" });
-  }
-});
-
-// Obtiene un resumen de ventas con totales y ganancia
-router.get("/report", authMiddleware, async (req, res) => {
-  try {
-    const { start, end, status, user_id } = req.query;
-
     const filter = {};
-    const and = [];
-
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
-
     if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
+      filter.createdAt = {};
+      if (startNorm) filter.createdAt.$gte = new Date(startNorm);
+      if (endNorm) filter.createdAt.$lte = new Date(endNorm);
     }
 
-    if (status) {
-      and.push({ status: String(status).toUpperCase() });
-    }
-
-    if (user_id) {
-      and.push({ user_id });
-    }
-
-    if (and.length > 0) {
-      filter.$and = and;
-    }
-
-    const sales = await Sale.find(filter);
-
-    // Calcula gastos activos en el mismo rango de fechas
-    const expFilter = {};
-    const expAnd = [];
-
-    if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      expAnd.push({ createdAt: range });
-    }
-
-    expAnd.push({ status: "ACTIVE" });
-
-    if (user_id) {
-      expAnd.push({ createdBy: user_id });
-    }
-
-    if (expAnd.length > 0) {
-      expFilter.$and = expAnd;
-    }
-
-    const expAgg = await Expense.aggregate([
-      { $match: expFilter },
+    const agg = await Payment.aggregate([
+      { $match: filter },
       {
         $group: {
-          _id: null,
+          _id: { method: "$method", provider: "$provider" },
           total: { $sum: "$amount" },
-          count: { $sum: 1 },
         },
       },
-      { $project: { _id: 0, total: 1, count: 1 } },
+      {
+        $project: {
+          _id: 0,
+          method: "$_id.method",
+          provider: "$_id.provider",
+          total: 1,
+        },
+      },
+      { $sort: { method: 1, provider: 1 } },
     ]);
 
-    const expenses_total = expAgg[0] ? roundInt(expAgg[0].total) : 0;
-    const expenses_count = expAgg[0] ? Number(expAgg[0].count || 0) : 0;
-
-    const count = sales.length;
-    let sumSubtotal = 0;
-    let sumDiscount = 0;
-    let sumTax = 0;
-    let sumTotal = 0;
-
-    for (const s of sales) {
-      sumSubtotal += Number(s.subtotal || 0);
-      sumDiscount += Number(s.discount_total || 0);
-      sumTax += Number(s.tax_total || 0);
-      sumTotal += Number(s.total || 0);
-    }
-
-    const profit = sumTotal;
-
-    return res.json({
-      ok: true,
-      summary: {
-        count,
-        subtotal: sumSubtotal,
-        discount_total: sumDiscount,
-        tax_total: sumTax,
-        total: sumTotal,
-        profit,
-        expenses_total,
-        expenses_count,
-        net_total: roundInt(sumTotal - expenses_total),
-      },
-    });
+    return res.json({ ok: true, items: agg });
   } catch (error) {
-    console.error("Error al obtener reporte de ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener reporte de ventas" });
+    console.error("Error en paymentsSummary:", error.message);
+    return res.status(500).json({ ok: false, error: "Error en paymentsSummary" });
   }
 });
 
@@ -549,30 +312,30 @@ router.get("/", authMiddleware, async (req, res) => {
     const endNorm = normalizeRangeDate(end, false);
 
     if (startNorm || endNorm) {
-      const range = {};
-      if (startNorm) range.$gte = new Date(startNorm);
-      if (endNorm) range.$lte = new Date(endNorm);
-      and.push({ createdAt: range });
+      filter.createdAt = {};
+      if (startNorm) filter.createdAt.$gte = new Date(startNorm);
+      if (endNorm) filter.createdAt.$lte = new Date(endNorm);
     }
 
     if (status) {
       and.push({ status: String(status).toUpperCase() });
     }
 
-    const qq = String(q || "").trim();
-    if (qq) {
-      const rx = new RegExp(qq.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      and.push({
-        $or: [{ note: rx }, { customer_name: rx }, { customer_phone: rx }],
-      });
+    if (q) {
+      const s = String(q || "").trim();
+      if (s) {
+        and.push({
+          $or: [
+            { client: { $regex: s, $options: "i" } },
+            { notes: { $regex: s, $options: "i" } },
+          ],
+        });
+      }
     }
 
-    if (and.length > 0) {
-      filter.$and = and;
-    }
+    if (and.length > 0) filter.$and = and;
 
-    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
-
+    const lim = Math.max(1, Math.min(500, toInt(limit, 200)));
     const items = await Sale.find(filter).sort({ createdAt: -1 }).limit(lim);
 
     return res.json({
@@ -595,9 +358,20 @@ router.get("/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Venta no encontrada" });
     }
 
-    const items = await SaleItem.find({ sale_id: sale.id }).sort({ createdAt: 1 });
-    const payments = await Payment.find({ sale_id: sale.id }).sort({ createdAt: 1 });
-    const returns = await SaleReturn.find({ sale: sale.id }).sort({ createdAt: 1 });
+    const saleIdStr = String(sale.id || sale._id || "");
+    const saleIdObj = sale._id || sale.id;
+
+    const items = await SaleItem.find({
+      $or: [{ sale_id: saleIdStr }, { sale_id: saleIdObj }, { sale: saleIdObj }, { sale: saleIdStr }],
+    }).sort({ createdAt: 1 });
+
+    const payments = await Payment.find({
+      $or: [{ sale_id: saleIdStr }, { sale_id: saleIdObj }, { sale: saleIdObj }, { sale: saleIdStr }],
+    }).sort({ createdAt: 1 });
+
+    const returns = await SaleReturn.find({
+      $or: [{ sale: saleIdObj }, { sale: saleIdStr }, { sale_id: saleIdStr }, { sale_id: saleIdObj }],
+    }).sort({ createdAt: 1 });
 
     return res.json({
       ok: true,
@@ -615,7 +389,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 // Crea una venta
 router.post("/", authMiddleware, async (req, res) => {
   try {
-    const payload = await buildSalePayload(req.body);
+    const payload = req.body || {};
 
     if (!payload.items || payload.items.length === 0) {
       return res.status(400).json({ ok: false, error: "Debe incluir items" });
@@ -633,33 +407,47 @@ router.post("/", authMiddleware, async (req, res) => {
       discount_total: payload.discount_total,
       tax_total: payload.tax_total,
       total: payload.total,
-      paid: payload.paid,
-      change: payload.change,
-      note: req.body.note || null,
-      user_id: req.user.id,
+      notes: payload.notes || null,
+      client: payload.client || null,
+      user_id: req.user?.id || req.user?._id,
     });
 
-    const createdItems = await createItemsForSale(sale, payload.items);
-    const createdPayments = await createPaymentsForSale(sale, payload.payments);
+    await createItemsForSale(sale, payload.items);
+    await createPaymentsForSale(sale, payload.payments || []);
 
-    await applyInventoryOutForSale(
-      { ...sale.toJSON(), id: sale.id, items: payload.items },
-      productMap,
-      recipeMap
-    );
+    await createInventoryMovesForSale(sale, productMap, recipeMap, payload.items);
 
-    return res.json({
-      ok: true,
-      sale: sale.toJSON(),
-      items: createdItems.map((it) => it.toJSON()),
-      payments: createdPayments.map((p) => p.toJSON()),
-    });
+    return res.json({ ok: true, sale: sale.toJSON() });
   } catch (error) {
     console.error("Error al crear venta:", error.message);
-    const code = error.status ? Number(error.status) : 500;
-    return res.status(code).json({ ok: false, error: error.message || "Error al crear venta" });
+    return res.status(500).json({ ok: false, error: "Error al crear venta" });
   }
 });
+
+// Anula venta
+router.post("/:id/void", authMiddleware, async (req, res) => {
+  try {
+    const saleId = String(req.params.id || "");
+    const sale = await Sale.findById(saleId);
+
+    if (!sale) {
+      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
+    }
+
+    if (sale.status === "VOIDED") {
+      return res.status(400).json({ ok: false, error: "La venta ya está anulada" });
+    }
+
+    sale.status = "VOIDED";
+    await sale.save();
+
+    return res.json({ ok: true, sale: sale.toJSON() });
+  } catch (error) {
+    console.error("Error al anular venta:", error.message);
+    return res.status(500).json({ ok: false, error: "Error al anular venta" });
+  }
+});
+
 // Crea devolución parcial de un item de venta
 router.post("/:id/returns", authMiddleware, async (req, res) => {
   try {
@@ -683,8 +471,8 @@ router.post("/:id/returns", authMiddleware, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Venta no encontrada" });
     }
 
-    const item = await SaleItem.findById(sale_item);
-    if (!item || String(item.sale_id) !== String(sale.id)) {
+    const item = await SaleItem.findById(String(sale_item));
+    if (!item) {
       return res.status(404).json({ ok: false, error: "Item no encontrado" });
     }
 
