@@ -12,15 +12,20 @@ const { usersRouter } = require("./routes/users.routes");
 // Importa el router de productos
 const { productsRouter } = require("./routes/products.routes");
 
-// Importa el router de inventario 
+// Importa el router de inventario
 const { inventoryRouter } = require("./routes/inventory.routes");
 
 // Importa el router de ventas
 const { salesRouter } = require("./routes/sales.routes");
+
+// Importa el router de recetas
 const { recipesRouter } = require("./routes/recipes.routes");
 
 // Importa el router de tabs
 const { tabsRouter } = require("./routes/tabs.routes");
+
+// Importa el router de gastos
+const { expensesRouter } = require("./routes/expenses.routes");
 
 // Crea la instancia de la aplicación Express
 const app = express();
@@ -28,7 +33,7 @@ const app = express();
 // Define orígenes permitidos para CORS
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://bar-pos-online-frontend.vercel.app", 
+  "https://bar-pos-online-frontend.vercel.app",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -93,6 +98,9 @@ app.use("/api/tabs", tabsRouter);
 
 // Monta las rutas de recetas bajo el prefijo /api/recipes
 app.use("/api/recipes", recipesRouter);
+
+// Monta las rutas de gastos bajo el prefijo /api/expenses
+app.use("/api/expenses", expensesRouter);
 
 // Exporta la aplicación configurada para usarla en server.js
 module.exports = app;
