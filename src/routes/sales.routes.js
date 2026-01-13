@@ -271,7 +271,7 @@ router.get("/catalog", authMiddleware, async (req, res) => {
 });
 
 // Obtiene catálogo con recetas para validar stock por ingredientes
-router.get("/with-recipes", authMiddleware, async (req, res) => {
+async function withRecipesHandler(req, res) {
   try {
     const products = await Product.find({ active: { $ne: false } }).sort({
       name: 1,
@@ -297,7 +297,10 @@ router.get("/with-recipes", authMiddleware, async (req, res) => {
       error: "Error al obtener catálogo con recetas",
     });
   }
-});
+}
+
+router.get("/with-recipes", authMiddleware, withRecipesHandler);
+router.post("/with-recipes", authMiddleware, withRecipesHandler);
 
 // Resume pagos por rango
 router.get("/paymentsSummary", authMiddleware, async (req, res) => {
@@ -476,12 +479,19 @@ router.post("/", authMiddleware, async (req, res) => {
     await createItemsForSale(sale, payload.items);
     await createPaymentsForSale(sale, payload.payments || []);
 
-    await createInventoryMovesForSale(sale, productMap, recipeMap, payload.items);
+    await createInventoryMovesForSale(
+      sale,
+      productMap,
+      recipeMap,
+      payload.items
+    );
 
     return res.json({ ok: true, sale: sale.toJSON() });
   } catch (error) {
     console.error("Error al crear venta:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al crear venta" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al crear venta" });
   }
 });
 
@@ -496,7 +506,9 @@ router.post("/:id/void", authMiddleware, async (req, res) => {
     }
 
     if (sale.status === "VOIDED") {
-      return res.status(400).json({ ok: false, error: "La venta ya está anulada" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "La venta ya está anulada" });
     }
 
     sale.status = "VOIDED";
@@ -505,7 +517,9 @@ router.post("/:id/void", authMiddleware, async (req, res) => {
     return res.json({ ok: true, sale: sale.toJSON() });
   } catch (error) {
     console.error("Error al anular venta:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al anular venta" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al anular venta" });
   }
 });
 
@@ -548,7 +562,9 @@ router.post("/:id/returns", authMiddleware, async (req, res) => {
     return res.json({ ok: true, item: created.toJSON() });
   } catch (error) {
     console.error("Error al crear devolución:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al crear devolución" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al crear devolución" });
   }
 });
 
