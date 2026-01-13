@@ -130,7 +130,9 @@ async function validateRecipeStock(productMap, recipeMap, items) {
     if (recipes.length === 0) {
       const stock = toNumber(product.stock, 0);
       if (stock < qty) {
-        throw new Error(`Stock insuficiente para ${product.name || "producto"} (${stock})`);
+        throw new Error(
+          `Stock insuficiente para ${product.name || "producto"} (${stock})`
+        );
       }
       continue;
     }
@@ -144,7 +146,9 @@ async function validateRecipeStock(productMap, recipeMap, items) {
       const have = toNumber(ing.stock, 0);
 
       if (have < need) {
-        throw new Error(`Stock insuficiente de insumo ${ing.name || "ingrediente"} (${have})`);
+        throw new Error(
+          `Stock insuficiente de insumo ${ing.name || "ingrediente"} (${have})`
+        );
       }
     }
   }
@@ -245,17 +249,53 @@ async function createItemsForSale(sale, items) {
 // Obtiene catálogo de ventas
 router.get("/catalog", authMiddleware, async (req, res) => {
   try {
-    const products = await Product.find({ active: { $ne: false } }).sort({ name: 1 });
-    const expenses = await Expense.find({ active: { $ne: false } }).sort({ name: 1 });
+    const products = await Product.find({ active: { $ne: false } }).sort({
+      name: 1,
+    });
+    const expenses = await Expense.find({ active: { $ne: false } }).sort({
+      name: 1,
+    });
 
     return res.json({
       ok: true,
       products: products.map((p) => p.toJSON()),
       expenses: expenses.map((e) => e.toJSON()),
+      items: products.map((p) => p.toJSON()),
     });
   } catch (error) {
     console.error("Error al obtener catálogo:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener catálogo" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al obtener catálogo" });
+  }
+});
+
+// Obtiene catálogo con recetas para validar stock por ingredientes
+router.get("/with-recipes", authMiddleware, async (req, res) => {
+  try {
+    const products = await Product.find({ active: { $ne: false } }).sort({
+      name: 1,
+    });
+    const expenses = await Expense.find({ active: { $ne: false } }).sort({
+      name: 1,
+    });
+
+    const productIds = products.map((p) => p._id);
+    const recipes = await ProductRecipe.find({ product: { $in: productIds } });
+
+    return res.json({
+      ok: true,
+      products: products.map((p) => p.toJSON()),
+      recipes: recipes.map((r) => r.toJSON()),
+      expenses: expenses.map((e) => e.toJSON()),
+      items: products.map((p) => p.toJSON()),
+    });
+  } catch (error) {
+    console.error("Error al obtener catálogo con recetas:", error.message);
+    return res.status(500).json({
+      ok: false,
+      error: "Error al obtener catálogo con recetas",
+    });
   }
 });
 
@@ -296,7 +336,9 @@ router.get("/paymentsSummary", authMiddleware, async (req, res) => {
     return res.json({ ok: true, items: agg });
   } catch (error) {
     console.error("Error en paymentsSummary:", error.message);
-    return res.status(500).json({ ok: false, error: "Error en paymentsSummary" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error en paymentsSummary" });
   }
 });
 
@@ -344,7 +386,9 @@ router.get("/", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al listar ventas:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al listar ventas" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al listar ventas" });
   }
 });
 
@@ -362,15 +406,30 @@ router.get("/:id", authMiddleware, async (req, res) => {
     const saleIdObj = sale._id || sale.id;
 
     const items = await SaleItem.find({
-      $or: [{ sale_id: saleIdStr }, { sale_id: saleIdObj }, { sale: saleIdObj }, { sale: saleIdStr }],
+      $or: [
+        { sale_id: saleIdStr },
+        { sale_id: saleIdObj },
+        { sale: saleIdObj },
+        { sale: saleIdStr },
+      ],
     }).sort({ createdAt: 1 });
 
     const payments = await Payment.find({
-      $or: [{ sale_id: saleIdStr }, { sale_id: saleIdObj }, { sale: saleIdObj }, { sale: saleIdStr }],
+      $or: [
+        { sale_id: saleIdStr },
+        { sale_id: saleIdObj },
+        { sale: saleIdObj },
+        { sale: saleIdStr },
+      ],
     }).sort({ createdAt: 1 });
 
     const returns = await SaleReturn.find({
-      $or: [{ sale: saleIdObj }, { sale: saleIdStr }, { sale_id: saleIdStr }, { sale_id: saleIdObj }],
+      $or: [
+        { sale: saleIdObj },
+        { sale: saleIdStr },
+        { sale_id: saleIdStr },
+        { sale_id: saleIdObj },
+      ],
     }).sort({ createdAt: 1 });
 
     return res.json({
@@ -382,7 +441,9 @@ router.get("/:id", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener venta:", error.message);
-    return res.status(500).json({ ok: false, error: "Error al obtener venta" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Error al obtener venta" });
   }
 });
 
