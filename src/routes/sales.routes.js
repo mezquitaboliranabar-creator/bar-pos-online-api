@@ -168,7 +168,13 @@ async function validateRecipeStock(productMap, recipeMap, items) {
 }
 
 // Crea movimientos de inventario por receta o producto directo
-async function createInventoryMovesForSale(sale, productMap, recipeMap, items, user) {
+async function createInventoryMovesForSale(
+  sale,
+  productMap,
+  recipeMap,
+  items,
+  user
+) {
   const moves = [];
   const list = ensureArray(items);
 
@@ -243,18 +249,42 @@ async function createPaymentsForSale(sale, payments, user) {
 async function createItemsForSale(sale, items, user) {
   const docs = [];
   for (const it of items || []) {
+    // Mapea el item a los campos requeridos por el modelo actual
+    const productRaw = it.productId || it.product_id || it.product;
+    if (!productRaw) {
+      throw new Error("Producto requerido en item");
+    }
+
+    const qty = Number(it.qty || 1);
+    const unitPrice = roundInt(it.unit_price ?? it.unitPrice ?? 0);
+    const lineDiscount = roundInt(it.line_discount ?? it.lineDiscount ?? 0);
+    const taxRate = Number(it.tax_rate ?? it.taxRate ?? 0);
+    const tax = roundInt(it.tax ?? 0);
+
+    const rawTotal = it.total ?? it.line_total ?? it.lineTotal;
+    const computedTotal = roundInt(qty * unitPrice - lineDiscount + tax);
+    const total = roundInt(rawTotal ?? computedTotal);
+
     const doc = {
-      product_id: it.productId || it.product_id || it.product,
-      name: it.name,
-      qty: Number(it.qty || 1),
-      unit_price: roundInt(it.unit_price),
-      line_discount: roundInt(it.line_discount),
-      tax_rate: Number(it.tax_rate || 0),
-      gross: roundInt(it.gross),
-      net: roundInt(it.net),
-      tax: roundInt(it.tax),
-      total: roundInt(it.total),
+      qty,
+      unit_price: unitPrice,
+      line_discount: lineDiscount,
+      tax_rate: taxRate,
+      gross: roundInt(it.gross ?? 0),
+      net: roundInt(it.net ?? 0),
+      tax,
+      total,
     };
+
+    if (hasSchemaPath(SaleItem, "product")) doc.product = productRaw;
+    if (hasSchemaPath(SaleItem, "product_id")) doc.product_id = productRaw;
+
+    const nameSnapshot = String(it.name_snapshot ?? it.name ?? "").trim();
+    if (hasSchemaPath(SaleItem, "name_snapshot"))
+      doc.name_snapshot = nameSnapshot;
+    if (hasSchemaPath(SaleItem, "name")) doc.name = nameSnapshot;
+
+    if (hasSchemaPath(SaleItem, "line_total")) doc.line_total = total;
 
     attachSaleRef(doc, sale, SaleItem);
     attachUserRef(doc, user, SaleItem);
@@ -495,7 +525,8 @@ router.post("/", authMiddleware, async (req, res) => {
       tax_total: payload.tax_total,
       total: payload.total,
       notes: payload.notes ?? payload.note ?? null,
-      client: payload.client ?? payload.customer_name ?? payload.customerName ?? null,
+      client:
+        payload.client ?? payload.customer_name ?? payload.customerName ?? null,
     };
 
     attachUserRef(saleDoc, req.user, Sale);
