@@ -1,59 +1,20 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const { authMiddleware } = require("./auth.routes");
 const Sale = require("../models/Sale");
 const SaleItem = require("../models/SaleItem");
 const Payment = require("../models/Payment");
 const SaleReturn = require("../models/SaleReturn");
 const Product = require("../models/Product");
-const InventoryMove = require("../models/InventoryMove");
 const ProductRecipe = require("../models/ProductRecipe");
 const Expense = require("../models/Expense");
 
-// Crea el router para agrupar las rutas de ventas
 const router = express.Router();
 
-// Verifica si un modelo tiene un campo en el schema
-function hasSchemaPath(Model, path) {
-  return Boolean(
-    Model &&
-      Model.schema &&
-      typeof Model.schema.path === "function" &&
-      Model.schema.path(path)
-  );
-}
-
-// Asigna referencia de venta usando los campos disponibles
-function attachSaleRef(doc, sale, Model) {
-  const saleObjId = sale?._id || sale?.id;
-  const saleStr = String(sale?.id || saleObjId || "");
-
-  if (hasSchemaPath(Model, "sale")) doc.sale = saleObjId;
-  if (hasSchemaPath(Model, "sale_id")) doc.sale_id = saleStr;
-
-  if (!hasSchemaPath(Model, "sale") && !hasSchemaPath(Model, "sale_id")) {
-    doc.sale_id = saleStr;
-  }
-}
-
-// Asigna usuario usando los campos disponibles
-function attachUserRef(doc, user, Model) {
-  const userObjId = user?._id || user?.id;
-  if (!userObjId) return;
-
-  if (hasSchemaPath(Model, "user")) doc.user = userObjId;
-  if (hasSchemaPath(Model, "user_id")) doc.user_id = userObjId;
-
-  if (!hasSchemaPath(Model, "user") && !hasSchemaPath(Model, "user_id")) {
-    doc.user = userObjId;
-  }
-}
-
-// Redondea un valor numérico a entero
 function roundInt(v) {
   return Math.round(Number(v || 0));
 }
 
-// Normaliza un string de fecha para rango (ISO)
 function normalizeRangeDate(value, isStart) {
   const s = String(value || "").trim();
   if (!s) return null;
@@ -74,189 +35,235 @@ function normalizeRangeDate(value, isStart) {
   return d.toISOString();
 }
 
-// Convierte a número seguro
-function toNumber(v, def = 0) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return n;
-}
+// Normaliza el payload de venta (calcula totales y normaliza items/pagos)
+async function buildSalePayload(body) {
+  const status = String(body?.status || "COMPLETED").toUpperCase();
+  const items = Array.isArray(body?.items) ? body.items : [];
+  const payments = Array.isArray(body?.payments) ? body.payments : [];
 
-// Convierte a entero seguro
-function toInt(v, def = 0) {
-  const n = Math.trunc(Number(v));
-  if (!Number.isFinite(n)) return def;
-  return n;
-}
+  const normalizedItems = [];
+  let subtotal = 0;
+  let discount_total = 0;
+  let tax_total = 0;
+  let total = 0;
 
-// Valida array no vacío
-function ensureArray(a) {
-  return Array.isArray(a) ? a : [];
-}
+  for (const it of items) {
+    const productId = it.productId || it.product_id || it.product;
+    const qty = Number(it.qty || it.quantity || 1);
 
-// Extrae ids únicos de productos de items
-function collectUniqueProductIds(items) {
-  const ids = new Set();
-  for (const it of ensureArray(items)) {
-    const id = it.productId || it.product_id || it.product;
-    if (id) ids.add(String(id));
+    const product = await Product.findById(productId);
+    if (!product) {
+      const err = new Error("Producto no encontrado");
+      err.status = 400;
+      throw err;
+    }
+
+    const unit_price = roundInt(it.unit_price ?? it.unitPrice ?? product.price ?? 0);
+    const line_discount = roundInt(it.line_discount ?? it.lineDiscount ?? 0);
+    const tax_rate = Number(it.tax_rate ?? it.taxRate ?? 0);
+
+    const net = roundInt(qty * unit_price - line_discount);
+    const tax = roundInt((net * tax_rate) / 100);
+    const line_total = roundInt(net + tax);
+
+    const name = String(it.name || product.name || "").trim();
+
+    const saleItem = {
+      productId: product.id,
+      product_id: product.id,
+      product: product.id,
+      name,
+      name_snapshot: name,
+      qty,
+      unit_price,
+      line_discount,
+      tax_rate,
+      net,
+      tax,
+      total: line_total,
+      line_total: line_total,
+    };
+
+    normalizedItems.push(saleItem);
+
+    subtotal += net;
+    discount_total += line_discount;
+    tax_total += tax;
+    total += line_total;
   }
-  return Array.from(ids);
+
+  const normalizedPayments = [];
+  let paid = 0;
+
+  for (const p of payments) {
+    const method = String(p.method || "").toUpperCase();
+    const provider = p.provider ? String(p.provider).toUpperCase() : null;
+    const reference = p.reference ? String(p.reference).trim() : null;
+    const amount = roundInt(p.amount);
+
+    normalizedPayments.push({ method, provider, amount, reference });
+    paid += amount;
+  }
+
+  return {
+    status,
+    subtotal: roundInt(subtotal),
+    discount_total: roundInt(discount_total),
+    tax_total: roundInt(tax_total),
+    total: roundInt(total),
+    paid: roundInt(paid),
+    change: roundInt(paid - total),
+    items: normalizedItems,
+    payments: normalizedPayments,
+    client: body?.client || null,
+    note: body?.note || null,
+  };
 }
 
-// Construye mapa de productos por id
-async function buildProductsMap(productIds) {
-  if (!productIds || productIds.length === 0) return new Map();
-  const products = await Product.find({ _id: { $in: productIds } });
-  const map = new Map();
-  for (const p of products) map.set(String(p._id), p);
-  return map;
+function collectUniqueProductIds(items) {
+  const ids = [];
+  for (const it of items) {
+    const pid = it.productId || it.product_id || it.product;
+    if (pid) ids.push(String(pid));
+  }
+  return [...new Set(ids)];
 }
 
-// Construye mapa de recetas por id producto
+async function buildProductsMap(ids) {
+  const products = await Product.find({ _id: { $in: ids } });
+  return new Map(products.map((p) => [p.id.toString(), p]));
+}
+
 async function buildRecipeMap(productIds) {
-  if (!productIds || productIds.length === 0) return new Map();
-  const recipes = await ProductRecipe.find({ product: { $in: productIds } });
+  const recipes = await ProductRecipe.find({ product_id: { $in: productIds } });
   const map = new Map();
   for (const r of recipes) {
-    const k = String(r.product);
-    if (!map.has(k)) map.set(k, []);
-    map.get(k).push(r);
+    const k = String(r.product_id);
+    map.set(k, r);
   }
   return map;
 }
 
-// Valida stock por receta (si aplica)
 async function validateRecipeStock(productMap, recipeMap, items) {
-  const list = ensureArray(items);
+  for (const it of items) {
+    const pid = it.productId || it.product_id || it.product;
+    const key = String(pid || "");
+    const recipe = recipeMap.get(key);
+    const qty = Number(it.qty || it.quantity || 1);
 
-  for (const it of list) {
-    const productId = String(it.productId || it.product_id || it.product || "");
-    const qty = toInt(it.qty, 1);
-
-    if (!productId) continue;
-
-    const product = productMap.get(productId);
-    const recipes = recipeMap.get(productId) || [];
-
-    if (!product) continue;
-
-    if (recipes.length === 0) {
-      const stock = toNumber(product.stock, 0);
-      if (stock < qty) {
-        throw new Error(
-          `Stock insuficiente para ${product.name || "producto"} (${stock})`
-        );
+    // Sin receta: valida stock del producto
+    if (!recipe) {
+      const product = productMap.get(key);
+      if (product) {
+        const stock = Number(product.stock || 0);
+        if (stock < qty) {
+          const err = new Error(`Stock insuficiente para ${product.name || "producto"}`);
+          err.status = 400;
+          throw err;
+        }
       }
       continue;
     }
 
-    // Si hay receta, validar insumos
-    for (const r of recipes) {
-      const ing = await Product.findById(r.ingredient);
-      if (!ing) continue;
+    // Con receta: valida stock de ingredientes
+    const ingredients = Array.isArray(recipe.items) ? recipe.items : [];
+    for (const ing of ingredients) {
+      const ingredientProductId = ing.product_id || ing.productId || ing.product;
+      if (!ingredientProductId) continue;
 
-      const need = toNumber(r.qty, 0) * qty;
-      const have = toNumber(ing.stock, 0);
+      const ingredient = productMap.get(String(ingredientProductId));
+      if (!ingredient) continue;
 
-      if (have < need) {
-        throw new Error(
-          `Stock insuficiente de insumo ${ing.name || "ingrediente"} (${have})`
-        );
+      const need = Number(ing.qty || 0) * qty;
+      const stock = Number(ingredient.stock || 0);
+
+      if (stock < need) {
+        const err = new Error("Stock insuficiente para preparar el producto");
+        err.status = 400;
+        throw err;
       }
     }
   }
 }
 
-// Crea movimientos de inventario por receta o producto directo
-async function createInventoryMovesForSale(
-  sale,
-  productMap,
-  recipeMap,
-  items,
-  user
-) {
-  const moves = [];
-  const list = ensureArray(items);
+// Descuenta stock inmediatamente al cerrar una venta (sin crear movimientos)
+async function decrementStockForSale(productMap, recipeMap, items, session) {
+  const dec = new Map();
 
-  for (const it of list) {
-    const productId = String(it.productId || it.product_id || it.product || "");
-    const qty = toInt(it.qty, 1);
-    if (!productId) continue;
+  for (const it of items || []) {
+    const pid = it.productId || it.product_id || it.product;
+    const key = String(pid || "");
+    const qty = Number(it.qty || it.quantity || 1);
+    if (!key) continue;
 
-    const product = productMap.get(productId);
-    const recipes = recipeMap.get(productId) || [];
+    const recipe = recipeMap.get(key);
 
-    if (!product) continue;
-
-    if (recipes.length === 0) {
-      const mv = {
-        type: "OUT",
-        reason: "SALE",
-        product: product._id,
-        qty: qty,
-        note: `Venta ${sale.id}`,
-        ref: { sale_id: sale.id },
-      };
-      attachSaleRef(mv, sale, InventoryMove);
-      attachUserRef(mv, user, InventoryMove);
-      moves.push(mv);
+    // Sin receta: descuenta producto directo
+    if (!recipe) {
+      dec.set(key, (dec.get(key) || 0) + qty);
       continue;
     }
 
-    for (const r of recipes) {
-      const mv = {
-        type: "OUT",
-        reason: "SALE_RECIPE",
-        product: r.ingredient,
-        qty: roundInt(toNumber(r.qty, 0) * qty),
-        note: `Venta ${sale.id} (${product.name || "producto"})`,
-        ref: { sale_id: sale.id },
-      };
-      attachSaleRef(mv, sale, InventoryMove);
-      attachUserRef(mv, user, InventoryMove);
-      moves.push(mv);
+    // Con receta: descuenta ingredientes
+    const ingredients = Array.isArray(recipe.items) ? recipe.items : [];
+    for (const ing of ingredients) {
+      const ingredientProductId = ing.product_id || ing.productId || ing.product;
+      if (!ingredientProductId) continue;
+
+      const ingKey = String(ingredientProductId);
+      const need = Number(ing.qty || 0) * qty;
+      if (need > 0) dec.set(ingKey, (dec.get(ingKey) || 0) + need);
     }
   }
 
-  if (moves.length === 0) return [];
+  const keys = Array.from(dec.keys()).sort();
+  for (const k of keys) {
+    const need = roundInt(dec.get(k));
+    if (need <= 0) continue;
 
-  const created = await InventoryMove.insertMany(moves, { ordered: true });
-  return created;
+    const name = productMap.get(String(k))?.name || "producto";
+
+    const r = await Product.updateOne(
+      { _id: k, stock: { $gte: need } },
+      { $inc: { stock: -need } },
+      { session }
+    );
+
+    const modified = r && (r.modifiedCount ?? r.nModified ?? 0);
+    if (!modified) {
+      const err = new Error(`Stock insuficiente para ${name}`);
+      err.status = 400;
+      throw err;
+    }
+  }
 }
 
-// Crea pagos asociados a una venta
-async function createPaymentsForSale(sale, payments, user) {
+async function createPaymentsForSale(sale, payments, user, session) {
   const docs = [];
   for (const p of payments || []) {
-    const doc = {
+    docs.push({
+      sale_id: sale.id,
+      sale: sale._id,
       method: p.method,
       provider: p.provider || null,
       reference: p.reference || null,
       amount: roundInt(p.amount),
-    };
-
-    attachSaleRef(doc, sale, Payment);
-    attachUserRef(doc, user, Payment);
-    docs.push(doc);
+      user: user?._id || user?.id,
+      user_id: user?._id || user?.id,
+    });
   }
-  if (docs.length === 0) return [];
 
-  const created = await Payment.insertMany(docs, { ordered: true });
-  return created;
+  if (docs.length === 0) return [];
+  return Payment.insertMany(docs, { ordered: true, session });
 }
 
-// Crea items asociados a una venta
-async function createItemsForSale(sale, items, user, productMap) {
+async function createItemsForSale(sale, items, user, session, productMap) {
   const docs = [];
   for (const it of items || []) {
-    // Mapea el item a los campos requeridos por el modelo actual
-    const productRaw = it.productId || it.product_id || it.product;
-    if (!productRaw) {
-      throw new Error("Producto requerido en item");
-    }
+    const productRaw = it.productId || it.product_id || it.product || it._id;
+    const qty = Number(it.qty || it.quantity || 1);
 
-    const qty = Number(it.qty || 1);
-    const unitPrice = roundInt(it.unit_price ?? it.unitPrice ?? 0);
+    const unitPrice = roundInt(it.unit_price ?? it.unitPrice ?? it.price ?? 0);
     const lineDiscount = roundInt(it.line_discount ?? it.lineDiscount ?? 0);
     const taxRate = Number(it.tax_rate ?? it.taxRate ?? 0);
     const tax = roundInt(it.tax ?? 0);
@@ -265,7 +272,19 @@ async function createItemsForSale(sale, items, user, productMap) {
     const computedTotal = roundInt(qty * unitPrice - lineDiscount + tax);
     const total = roundInt(rawTotal ?? computedTotal);
 
-    const doc = {
+    let nameSnapshot = String(it.name_snapshot ?? it.name ?? it.productName ?? "").trim();
+    if (!nameSnapshot && productMap) {
+      const p = productMap.get(String(productRaw));
+      if (p && p.name) nameSnapshot = String(p.name).trim();
+    }
+
+    docs.push({
+      sale_id: sale.id,
+      sale: sale._id,
+      product: productRaw,
+      product_id: productRaw,
+      name_snapshot: nameSnapshot,
+      name: nameSnapshot,
       qty,
       unit_price: unitPrice,
       line_discount: lineDiscount,
@@ -273,49 +292,22 @@ async function createItemsForSale(sale, items, user, productMap) {
       gross: roundInt(it.gross ?? 0),
       net: roundInt(it.net ?? 0),
       tax,
+      line_total: total,
       total,
-    };
-
-    if (hasSchemaPath(SaleItem, "product")) doc.product = productRaw;
-    if (hasSchemaPath(SaleItem, "product_id")) doc.product_id = productRaw;
-
-        let nameSnapshot = String(it.name_snapshot ?? it.name ?? it.productName ?? "").trim();
-
-    if (!nameSnapshot) {
-      const p = productMap && productMap.get(String(productRaw));
-      if (p && p.name) nameSnapshot = String(p.name).trim();
-    }
-
-    if (hasSchemaPath(SaleItem, "name_snapshot")) doc.name_snapshot = nameSnapshot;
-    if (hasSchemaPath(SaleItem, "name")) doc.name = nameSnapshot;
-
-    if (hasSchemaPath(SaleItem, "name_snapshot") && !nameSnapshot) {
-      throw new Error("Nombre requerido en item (name_snapshot)");
-    }
-
-
-    if (hasSchemaPath(SaleItem, "line_total")) doc.line_total = total;
-
-    attachSaleRef(doc, sale, SaleItem);
-    attachUserRef(doc, user, SaleItem);
-    docs.push(doc);
+      user: user?._id || user?.id,
+      user_id: user?._id || user?.id,
+    });
   }
 
   if (docs.length === 0) return [];
-
-  const created = await SaleItem.insertMany(docs, { ordered: true });
-  return created;
+  return SaleItem.insertMany(docs, { ordered: true, session });
 }
 
-// Obtiene catálogo de ventas
+// Catalogo (productos + gastos)
 router.get("/catalog", authMiddleware, async (req, res) => {
   try {
-    const products = await Product.find({ active: { $ne: false } }).sort({
-      name: 1,
-    });
-    const expenses = await Expense.find({ active: { $ne: false } }).sort({
-      name: 1,
-    });
+    const products = await Product.find({ active: { $ne: false } }).sort({ name: 1 });
+    const expenses = await Expense.find({ active: { $ne: false } }).sort({ name: 1 });
 
     return res.json({
       ok: true,
@@ -325,134 +317,83 @@ router.get("/catalog", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener catálogo:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al obtener catálogo" });
+    return res.status(500).json({ ok: false, error: "Error al obtener catálogo" });
   }
 });
 
-// Obtiene catálogo con recetas para validar stock por ingredientes
-async function withRecipesHandler(req, res) {
+// Crea una venta (descuenta stock dentro de la misma transacción)
+router.post("/", authMiddleware, async (req, res) => {
   try {
-    const products = await Product.find({ active: { $ne: false } }).sort({
-      name: 1,
-    });
-    const expenses = await Expense.find({ active: { $ne: false } }).sort({
-      name: 1,
-    });
+    const payload = await buildSalePayload(req.body);
 
-    const productIds = products.map((p) => p._id);
-    const recipes = await ProductRecipe.find({ product: { $in: productIds } });
-
-    return res.json({
-      ok: true,
-      products: products.map((p) => p.toJSON()),
-      recipes: recipes.map((r) => r.toJSON()),
-      expenses: expenses.map((e) => e.toJSON()),
-      items: products.map((p) => p.toJSON()),
-    });
-  } catch (error) {
-    console.error("Error al obtener catálogo con recetas:", error.message);
-    return res.status(500).json({
-      ok: false,
-      error: "Error al obtener catálogo con recetas",
-    });
-  }
-}
-
-router.get("/with-recipes", authMiddleware, withRecipesHandler);
-router.post("/with-recipes", authMiddleware, withRecipesHandler);
-
-// Resume pagos por rango
-router.get("/paymentsSummary", authMiddleware, async (req, res) => {
-  try {
-    const { start, end } = req.query;
-
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
-
-    const filter = {};
-    if (startNorm || endNorm) {
-      filter.createdAt = {};
-      if (startNorm) filter.createdAt.$gte = new Date(startNorm);
-      if (endNorm) filter.createdAt.$lte = new Date(endNorm);
+    if (!payload.items || payload.items.length === 0) {
+      return res.status(400).json({ ok: false, error: "Debe incluir items" });
     }
 
-    const agg = await Payment.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: { method: "$method", provider: "$provider" },
-          total: { $sum: "$amount" },
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          method: "$_id.method",
-          provider: "$_id.provider",
-          total: 1,
-        },
-      },
-      { $sort: { method: 1, provider: 1 } },
-    ]);
+    const productIds = collectUniqueProductIds(payload.items);
+    const recipeMap = await buildRecipeMap(productIds);
 
-    return res.json({ ok: true, items: agg });
-  } catch (error) {
-    console.error("Error en paymentsSummary:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error en paymentsSummary" });
-  }
-});
-
-// Lista ventas con filtros
-router.get("/", authMiddleware, async (req, res) => {
-  try {
-    const { start, end, status, q, limit } = req.query;
-
-    const filter = {};
-    const and = [];
-
-    const startNorm = normalizeRangeDate(start, true);
-    const endNorm = normalizeRangeDate(end, false);
-
-    if (startNorm || endNorm) {
-      filter.createdAt = {};
-      if (startNorm) filter.createdAt.$gte = new Date(startNorm);
-      if (endNorm) filter.createdAt.$lte = new Date(endNorm);
-    }
-
-    if (status) {
-      and.push({ status: String(status).toUpperCase() });
-    }
-
-    if (q) {
-      const s = String(q || "").trim();
-      if (s) {
-        and.push({
-          $or: [
-            { client: { $regex: s, $options: "i" } },
-            { notes: { $regex: s, $options: "i" } },
-          ],
-        });
+    // Incluye ingredientes en el mapa para validar y descontar
+    const allIds = new Set(productIds);
+    for (const r of recipeMap.values()) {
+      const items = Array.isArray(r.items) ? r.items : [];
+      for (const ing of items) {
+        const ingredientProductId = ing.product_id || ing.productId || ing.product;
+        if (ingredientProductId) allIds.add(String(ingredientProductId));
       }
     }
 
-    if (and.length > 0) filter.$and = and;
+    const productMap = await buildProductsMap(Array.from(allIds));
+    await validateRecipeStock(productMap, recipeMap, payload.items);
 
-    const lim = Math.max(1, Math.min(500, toInt(limit, 200)));
-    const items = await Sale.find(filter).sort({ createdAt: -1 }).limit(lim);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    return res.json({
-      ok: true,
-      items: items.map((s) => s.toJSON()),
-    });
+    try {
+      const saleDoc = {
+        status: payload.status,
+        subtotal: payload.subtotal,
+        discount_total: payload.discount_total,
+        tax_total: payload.tax_total,
+        total: payload.total,
+        paid: payload.paid,
+        change: payload.change,
+        note: payload.note || null,
+        client: payload.client || null,
+        user: req.user?._id || req.user?.id,
+        user_id: req.user?._id || req.user?.id,
+      };
+
+      const createdSaleArr = await Sale.create([saleDoc], { session });
+      const sale = createdSaleArr[0];
+
+      const createdItems = await createItemsForSale(sale, payload.items, req.user, session, productMap);
+      const createdPayments = await createPaymentsForSale(sale, payload.payments, req.user, session);
+
+      await decrementStockForSale(productMap, recipeMap, payload.items, session);
+
+      await session.commitTransaction();
+      session.endSession();
+
+      return res.json({
+        ok: true,
+        sale: sale.toJSON(),
+        items: createdItems.map((it) => it.toJSON()),
+        payments: createdPayments.map((p) => p.toJSON()),
+      });
+    } catch (err) {
+      await session.abortTransaction();
+      session.endSession();
+      throw err;
+    }
   } catch (error) {
-    console.error("Error al listar ventas:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al listar ventas" });
+    console.error("Error al crear venta:", error.message);
+    const code = error.status ? Number(error.status) : 500;
+    return res.status(code).json({
+      ok: false,
+      error: error.message || "Error al crear venta",
+      detail: error.message,
+    });
   }
 });
 
@@ -466,35 +407,9 @@ router.get("/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Venta no encontrada" });
     }
 
-    const saleIdStr = String(sale.id || sale._id || "");
-    const saleIdObj = sale._id || sale.id;
-
-    const items = await SaleItem.find({
-      $or: [
-        { sale_id: saleIdStr },
-        { sale_id: saleIdObj },
-        { sale: saleIdObj },
-        { sale: saleIdStr },
-      ],
-    }).sort({ createdAt: 1 });
-
-    const payments = await Payment.find({
-      $or: [
-        { sale_id: saleIdStr },
-        { sale_id: saleIdObj },
-        { sale: saleIdObj },
-        { sale: saleIdStr },
-      ],
-    }).sort({ createdAt: 1 });
-
-    const returns = await SaleReturn.find({
-      $or: [
-        { sale: saleIdObj },
-        { sale: saleIdStr },
-        { sale_id: saleIdStr },
-        { sale_id: saleIdObj },
-      ],
-    }).sort({ createdAt: 1 });
+    const items = await SaleItem.find({ sale_id: sale.id }).sort({ createdAt: 1 });
+    const payments = await Payment.find({ sale_id: sale.id }).sort({ createdAt: 1 });
+    const returns = await SaleReturn.find({ sale: sale.id }).sort({ createdAt: 1 });
 
     return res.json({
       ok: true,
@@ -505,89 +420,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Error al obtener venta:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al obtener venta" });
-  }
-});
-
-// Crea una venta
-router.post("/", authMiddleware, async (req, res) => {
-  try {
-    const payload = req.body || {};
-
-    if (!payload.items || payload.items.length === 0) {
-      return res.status(400).json({ ok: false, error: "Debe incluir items" });
-    }
-
-    const productIds = collectUniqueProductIds(payload.items);
-    const productMap = await buildProductsMap(productIds);
-    const recipeMap = await buildRecipeMap(productIds);
-
-    await validateRecipeStock(productMap, recipeMap, payload.items);
-
-    const status = String(payload.status || "COMPLETED").toUpperCase();
-
-    const saleDoc = {
-      status,
-      subtotal: payload.subtotal,
-      discount_total: payload.discount_total,
-      tax_total: payload.tax_total,
-      total: payload.total,
-      notes: payload.notes ?? payload.note ?? null,
-      client:
-        payload.client ?? payload.customer_name ?? payload.customerName ?? null,
-    };
-
-    attachUserRef(saleDoc, req.user, Sale);
-
-    const sale = await Sale.create(saleDoc);
-
-     await createItemsForSale(sale, payload.items, req.user, productMap);
-    await createPaymentsForSale(sale, payload.payments || [], req.user);
-
-    await createInventoryMovesForSale(
-      sale,
-      productMap,
-      recipeMap,
-      payload.items,
-      req.user
-    );
-
-    return res.json({ ok: true, sale: sale.toJSON() });
-  } catch (error) {
-    console.error("Error al crear venta:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al crear venta", detail: error.message });
-  }
-});
-
-// Anula venta
-router.post("/:id/void", authMiddleware, async (req, res) => {
-  try {
-    const saleId = String(req.params.id || "");
-    const sale = await Sale.findById(saleId);
-
-    if (!sale) {
-      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
-    }
-
-    if (sale.status === "VOIDED") {
-      return res
-        .status(400)
-        .json({ ok: false, error: "La venta ya está anulada" });
-    }
-
-    sale.status = "VOIDED";
-    await sale.save();
-
-    return res.json({ ok: true, sale: sale.toJSON() });
-  } catch (error) {
-    console.error("Error al anular venta:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al anular venta" });
+    return res.status(500).json({ ok: false, error: "Error al obtener venta" });
   }
 });
 
@@ -614,8 +447,8 @@ router.post("/:id/returns", authMiddleware, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Venta no encontrada" });
     }
 
-    const item = await SaleItem.findById(String(sale_item));
-    if (!item) {
+    const item = await SaleItem.findById(sale_item);
+    if (!item || String(item.sale_id) !== String(sale.id)) {
       return res.status(404).json({ ok: false, error: "Item no encontrado" });
     }
 
@@ -630,9 +463,7 @@ router.post("/:id/returns", authMiddleware, async (req, res) => {
     return res.json({ ok: true, item: created.toJSON() });
   } catch (error) {
     console.error("Error al crear devolución:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al crear devolución" });
+    return res.status(500).json({ ok: false, error: "Error al crear devolución" });
   }
 });
 
