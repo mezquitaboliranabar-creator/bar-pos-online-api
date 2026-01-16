@@ -246,7 +246,7 @@ async function createPaymentsForSale(sale, payments, user) {
 }
 
 // Crea items asociados a una venta
-async function createItemsForSale(sale, items, user) {
+async function createItemsForSale(sale, items, user, productMap) {
   const docs = [];
   for (const it of items || []) {
     // Mapea el item a los campos requeridos por el modelo actual
@@ -279,10 +279,20 @@ async function createItemsForSale(sale, items, user) {
     if (hasSchemaPath(SaleItem, "product")) doc.product = productRaw;
     if (hasSchemaPath(SaleItem, "product_id")) doc.product_id = productRaw;
 
-    const nameSnapshot = String(it.name_snapshot ?? it.name ?? "").trim();
-    if (hasSchemaPath(SaleItem, "name_snapshot"))
-      doc.name_snapshot = nameSnapshot;
+        let nameSnapshot = String(it.name_snapshot ?? it.name ?? it.productName ?? "").trim();
+
+    if (!nameSnapshot) {
+      const p = productMap && productMap.get(String(productRaw));
+      if (p && p.name) nameSnapshot = String(p.name).trim();
+    }
+
+    if (hasSchemaPath(SaleItem, "name_snapshot")) doc.name_snapshot = nameSnapshot;
     if (hasSchemaPath(SaleItem, "name")) doc.name = nameSnapshot;
+
+    if (hasSchemaPath(SaleItem, "name_snapshot") && !nameSnapshot) {
+      throw new Error("Nombre requerido en item (name_snapshot)");
+    }
+
 
     if (hasSchemaPath(SaleItem, "line_total")) doc.line_total = total;
 
@@ -533,7 +543,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const sale = await Sale.create(saleDoc);
 
-    await createItemsForSale(sale, payload.items, req.user);
+     await createItemsForSale(sale, payload.items, req.user, productMap);
     await createPaymentsForSale(sale, payload.payments || [], req.user);
 
     await createInventoryMovesForSale(
