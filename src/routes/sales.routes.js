@@ -168,7 +168,7 @@ async function validateRecipeStock(productMap, recipeMap, items) {
 }
 
 // Crea movimientos de inventario por receta o producto directo
-async function createInventoryMovesForSale(sale, productMap, recipeMap, items) {
+async function createInventoryMovesForSale(sale, productMap, recipeMap, items, user) {
   const moves = [];
   const list = ensureArray(items);
 
@@ -183,26 +183,32 @@ async function createInventoryMovesForSale(sale, productMap, recipeMap, items) {
     if (!product) continue;
 
     if (recipes.length === 0) {
-      moves.push({
+      const mv = {
         type: "OUT",
         reason: "SALE",
         product: product._id,
         qty: qty,
         note: `Venta ${sale.id}`,
         ref: { sale_id: sale.id },
-      });
+      };
+      attachSaleRef(mv, sale, InventoryMove);
+      attachUserRef(mv, user, InventoryMove);
+      moves.push(mv);
       continue;
     }
 
     for (const r of recipes) {
-      moves.push({
+      const mv = {
         type: "OUT",
         reason: "SALE_RECIPE",
         product: r.ingredient,
         qty: roundInt(toNumber(r.qty, 0) * qty),
         note: `Venta ${sale.id} (${product.name || "producto"})`,
         ref: { sale_id: sale.id },
-      });
+      };
+      attachSaleRef(mv, sale, InventoryMove);
+      attachUserRef(mv, user, InventoryMove);
+      moves.push(mv);
     }
   }
 
@@ -213,7 +219,7 @@ async function createInventoryMovesForSale(sale, productMap, recipeMap, items) {
 }
 
 // Crea pagos asociados a una venta
-async function createPaymentsForSale(sale, payments) {
+async function createPaymentsForSale(sale, payments, user) {
   const docs = [];
   for (const p of payments || []) {
     const doc = {
@@ -224,6 +230,7 @@ async function createPaymentsForSale(sale, payments) {
     };
 
     attachSaleRef(doc, sale, Payment);
+    attachUserRef(doc, user, Payment);
     docs.push(doc);
   }
   if (docs.length === 0) return [];
@@ -233,7 +240,7 @@ async function createPaymentsForSale(sale, payments) {
 }
 
 // Crea items asociados a una venta
-async function createItemsForSale(sale, items) {
+async function createItemsForSale(sale, items, user) {
   const docs = [];
   for (const it of items || []) {
     const doc = {
@@ -250,6 +257,7 @@ async function createItemsForSale(sale, items) {
     };
 
     attachSaleRef(doc, sale, SaleItem);
+    attachUserRef(doc, user, SaleItem);
     docs.push(doc);
   }
 
@@ -494,14 +502,15 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const sale = await Sale.create(saleDoc);
 
-    await createItemsForSale(sale, payload.items);
-    await createPaymentsForSale(sale, payload.payments || []);
+    await createItemsForSale(sale, payload.items, req.user);
+    await createPaymentsForSale(sale, payload.payments || [], req.user);
 
     await createInventoryMovesForSale(
       sale,
       productMap,
       recipeMap,
-      payload.items
+      payload.items,
+      req.user
     );
 
     return res.json({ ok: true, sale: sale.toJSON() });
@@ -509,7 +518,7 @@ router.post("/", authMiddleware, async (req, res) => {
     console.error("Error al crear venta:", error.message);
     return res
       .status(500)
-      .json({ ok: false, error: "Error al crear venta" });
+      .json({ ok: false, error: "Error al crear venta", detail: error.message });
   }
 });
 
