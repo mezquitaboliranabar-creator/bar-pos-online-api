@@ -35,6 +35,19 @@ function attachSaleRef(doc, sale, Model) {
   }
 }
 
+// Asigna usuario usando los campos disponibles
+function attachUserRef(doc, user, Model) {
+  const userObjId = user?._id || user?.id;
+  if (!userObjId) return;
+
+  if (hasSchemaPath(Model, "user")) doc.user = userObjId;
+  if (hasSchemaPath(Model, "user_id")) doc.user_id = userObjId;
+
+  if (!hasSchemaPath(Model, "user") && !hasSchemaPath(Model, "user_id")) {
+    doc.user = userObjId;
+  }
+}
+
 // Redondea un valor numérico a entero
 function roundInt(v) {
   return Math.round(Number(v || 0));
@@ -465,16 +478,21 @@ router.post("/", authMiddleware, async (req, res) => {
 
     await validateRecipeStock(productMap, recipeMap, payload.items);
 
-    const sale = await Sale.create({
-      status: payload.status,
+    const status = String(payload.status || "COMPLETED").toUpperCase();
+
+    const saleDoc = {
+      status,
       subtotal: payload.subtotal,
       discount_total: payload.discount_total,
       tax_total: payload.tax_total,
       total: payload.total,
-      notes: payload.notes || null,
-      client: payload.client || null,
-      user_id: req.user?.id || req.user?._id,
-    });
+      notes: payload.notes ?? payload.note ?? null,
+      client: payload.client ?? payload.customer_name ?? payload.customerName ?? null,
+    };
+
+    attachUserRef(saleDoc, req.user, Sale);
+
+    const sale = await Sale.create(saleDoc);
 
     await createItemsForSale(sale, payload.items);
     await createPaymentsForSale(sale, payload.payments || []);
