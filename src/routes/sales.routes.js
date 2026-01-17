@@ -397,7 +397,7 @@ async function applyReturnsAndRestock(session, { sale, lines, note, user }) {
     });
 
     await r.save({ session });
-    created.append(r);
+    created.push(r);
 
     const productId = getItemProductId(item);
     if (!productId) {
@@ -603,7 +603,7 @@ async function applyReturnsBatchInTxn({ sale, lines, note, user, session }) {
     });
 
     await retDoc.save({ session });
-    created.append(retDoc);
+    created.push(retDoc);
 
     refundTotal += refund_amount;
 
