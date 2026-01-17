@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const { authMiddleware } = require("./auth.routes");
 const Sale = require("../models/Sale");
 const SaleItem = require("../models/SaleItem");
@@ -6,6 +7,7 @@ const Payment = require("../models/Payment");
 const SaleReturn = require("../models/SaleReturn");
 const Product = require("../models/Product");
 const ProductRecipe = require("../models/ProductRecipe");
+const InventoryMove = require("../models/InventoryMove");
 const Expense = require("../models/Expense");
 
 // Crea el router para agrupar las rutas de ventas
@@ -249,6 +251,412 @@ async function rollbackStock(applied) {
       console.error("Rollback stock falló:", e.message);
     }
   }
+}
+
+
+// Convierte a número seguro (alias local)
+function toNum(v, def = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return n;
+}
+
+function getSaleInfo(sale) {
+  const saleObjId = sale?._id || sale?.id;
+  const saleStr = String(sale?.id || saleObjId || "");
+  return { saleObjId, saleStr };
+}
+
+function itemBelongsToSale(item, saleInfo) {
+  const sObj = saleInfo.saleObjId;
+  const sStr = saleInfo.saleStr;
+
+  if (item && item.sale != null && String(item.sale) === String(sObj)) return true;
+  if (item && item.sale != null && String(item.sale) === String(sStr)) return true;
+  if (item && item.sale_id != null && String(item.sale_id) === String(sObj)) return true;
+  if (item && item.sale_id != null && String(item.sale_id) === String(sStr)) return true;
+
+  return false;
+}
+
+function getItemProductId(item) {
+  return item?.product || item?.product_id || item?.productId || null;
+}
+
+// Calcula el total unitario para reembolso basado en el ítem
+function computeReturnUnitTotal(item) {
+  const soldQty = Math.max(1, roundInt(item?.qty || 1));
+  const unitPrice = roundInt(item?.unit_price ?? item?.unitPrice ?? 0);
+  const lineDiscount = roundInt(item?.line_discount ?? item?.lineDiscount ?? 0);
+
+  const unitDisc = lineDiscount > 0 ? Math.floor(lineDiscount / soldQty) : 0;
+  const unitBase = Math.max(0, unitPrice - unitDisc);
+
+  let unitTax = 0;
+  const taxRate = toNum(item?.tax_rate ?? item?.taxRate ?? 0, 0);
+  if (taxRate > 0) {
+    unitTax = Math.round((unitBase * taxRate) / 100);
+  } else {
+    const lineTax = roundInt(item?.tax ?? 0);
+    unitTax = lineTax > 0 ? Math.round(lineTax / soldQty) : 0;
+  }
+
+  return Math.max(0, roundInt(unitBase + unitTax));
+}
+
+async function sumReturnedQtyForItem(session, saleObjId, saleItemObjId) {
+  const agg = await SaleReturn.aggregate([
+    {
+      $match: {
+        sale: saleObjId,
+        sale_item: saleItemObjId,
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        qty: { $sum: "$qty" },
+      },
+    },
+  ]).session(session);
+
+  const v = agg && agg[0] ? Number(agg[0].qty || 0) : 0;
+  return Number.isFinite(v) ? v : 0;
+}
+
+async function createInventoryMoveForReturn(session, { productId, qty, note, user, saleId }) {
+  const moveDoc = {
+    product: productId,
+    qty: qty,
+    note: note || "Devolución de venta",
+    user: user ? user.id : null,
+    type: "RETURN",
+    sourceRef: saleId || null,
+    location: null,
+    supplierId: null,
+    supplierName: null,
+    invoiceNumber: null,
+    unitCost: null,
+    discount: null,
+    tax: null,
+    lot: null,
+    expiryDate: null,
+  };
+
+  const move = new InventoryMove(moveDoc);
+  await move.save({ session });
+  return move;
+}
+
+async function applyReturnsAndRestock(session, { sale, lines, note, user }) {
+  const saleInfo = getSaleInfo(sale);
+
+  if (sale.status === "VOIDED") {
+    throw new Error("La venta ya está anulada");
+  }
+
+  const created = [];
+
+  for (const ln of Array.isArray(lines) ? lines : []) {
+    const saleItemId = String(ln.sale_item_id || ln.sale_item || ln.saleItemId || "");
+    const qty = Number(ln.qty || 0);
+
+    if (!saleItemId) {
+      throw new Error("sale_item_id requerido");
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw new Error("Cantidad inválida");
+    }
+
+    const item = await SaleItem.findById(saleItemId).session(session);
+    if (!item) {
+      throw new Error("Item no encontrado");
+    }
+
+    if (!itemBelongsToSale(item, saleInfo)) {
+      throw new Error("El item no pertenece a la venta");
+    }
+
+    const soldQty = Math.max(0, toNum(item.qty, 0));
+    const returnedBefore = await sumReturnedQtyForItem(session, saleInfo.saleObjId, item._id);
+    const remaining = Math.max(0, soldQty - returnedBefore);
+
+    if (qty > remaining) {
+      throw new Error("La cantidad a devolver supera lo vendido");
+    }
+
+    const unitTotal = computeReturnUnitTotal(item);
+    const refundAmount = roundInt(unitTotal * qty);
+
+    const r = new SaleReturn({
+      sale: saleInfo.saleObjId,
+      sale_item: item._id,
+      qty: qty,
+      refund_amount: refundAmount,
+      note: note ?? null,
+    });
+
+    await r.save({ session });
+    created.append(r);
+
+    const productId = getItemProductId(item);
+    if (!productId) {
+      throw new Error("No se pudo determinar el producto del item");
+    }
+
+    const product = await Product.findById(productId).session(session);
+    if (!product) {
+      throw new Error("Producto no encontrado para reingresar stock");
+    }
+
+    const prevStock = Number(product.stock || 0);
+    product.stock = prevStock + Number(qty);
+    await product.save({ session });
+
+    await createInventoryMoveForReturn(session, {
+      productId: product._id,
+      qty: Number(qty),
+      note: note || `Devolución venta ${saleInfo.saleStr}`,
+      user,
+      saleId: saleInfo.saleStr,
+    });
+  }
+
+  if (created.length) {
+    // Actualiza estado de la venta según lo devuelto
+    const allItems = await SaleItem.find({
+      $or: [
+        { sale: saleInfo.saleObjId },
+        { sale_id: saleInfo.saleStr },
+        { sale: saleInfo.saleStr },
+      ],
+    }).session(session);
+
+    const agg = await SaleReturn.aggregate([
+      { $match: { sale: saleInfo.saleObjId } },
+      { $group: { _id: "$sale_item", qty: { $sum: "$qty" } } },
+    ]).session(session);
+
+    const byItem = new Map();
+    for (const row of agg || []) {
+      byItem.set(String(row._id), Number(row.qty || 0));
+    }
+
+    let fully = true;
+    for (const it of allItems || []) {
+      const sold = Number(it.qty || 0);
+      const ret = Number(byItem.get(String(it._id)) || 0);
+      if (sold > 0 && ret < sold) {
+        fully = false;
+        break;
+      }
+    }
+
+    sale.status = fully ? "REFUNDED" : "PARTIAL_REFUND";
+    await sale.save({ session });
+  }
+
+  return created;
+}
+
+
+
+// Obtiene info de ids de venta para comparaciones
+function saleIdInfoFromSale(sale) {
+  const saleObjId = sale?._id || sale?.id;
+  const saleStr = String(sale?.id || saleObjId || "");
+  return { saleObjId, saleStr };
+}
+
+// Verifica si un item pertenece a una venta
+function saleItemBelongsToSale(item, saleInfo) {
+  const saleObjId = saleInfo?.saleObjId;
+  const saleStr = saleInfo?.saleStr;
+
+  const itemSale = item?.sale;
+  const itemSaleId = item?.sale_id;
+
+  if (itemSale != null && String(itemSale) === String(saleObjId)) return true;
+  if (itemSale != null && String(itemSale) === String(saleStr)) return true;
+  if (itemSaleId != null && String(itemSaleId) === String(saleObjId)) return true;
+  if (itemSaleId != null && String(itemSaleId) === String(saleStr)) return true;
+
+  return false;
+}
+
+// Extrae el id de producto desde un SaleItem
+function getProductIdFromSaleItem(item) {
+  return item?.product || item?.product_id || null;
+}
+
+// Calcula el monto de reembolso para una cantidad devuelta (producto final)
+function computeRefundAmountForReturn(item, returnQty) {
+  const soldQty = Math.max(1, toNumber(item?.qty, 1));
+
+  const unitPrice = roundInt(item?.unit_price ?? 0);
+  const lineDiscount = roundInt(item?.line_discount ?? 0);
+  const taxRate = toNumber(item?.tax_rate ?? 0, 0);
+  const lineTax = roundInt(item?.tax ?? 0);
+
+  const unitDisc = soldQty > 0 ? Math.floor(lineDiscount / soldQty) : 0;
+  const unitBase = Math.max(0, unitPrice - unitDisc);
+
+  let unitTax = 0;
+  if (taxRate > 0) {
+    unitTax = Math.round((unitBase * taxRate) / 100);
+  } else if (soldQty > 0 && lineTax > 0) {
+    unitTax = Math.round(lineTax / soldQty);
+  }
+
+  const unitTotal = roundInt(unitBase + unitTax);
+  return roundInt(unitTotal * Math.max(0, toInt(returnQty, 0)));
+}
+
+// Crea movimiento de inventario consistente con inventory.routes
+function buildReturnMoveDoc(productId, qty, note, user, sourceRef, location) {
+  return {
+    product: productId,
+    qty,
+    note: note || "Devolución de venta",
+    user: user ? user.id : null,
+    type: "RETURN",
+    sourceRef: sourceRef || null,
+    location: location || null,
+    supplierId: null,
+    supplierName: null,
+    invoiceNumber: null,
+    unitCost: null,
+    discount: null,
+    tax: null,
+    lot: null,
+    expiryDate: null,
+  };
+}
+
+// Aplica devoluciones (batch) dentro de una transacción y reingresa stock
+async function applyReturnsBatchInTxn({ sale, lines, note, user, session }) {
+  const saleInfo = saleIdInfoFromSale(sale);
+  const saleObjId = saleInfo.saleObjId;
+
+  const safeLines = ensureArray(lines)
+    .map((l) => {
+      const saleItemId = l.sale_item_id || l.sale_item || l.saleItemId || l.saleItem || null;
+      const qty = toInt(l.qty, 0);
+      return { saleItemId: saleItemId ? String(saleItemId) : null, qty };
+    })
+    .filter((l) => l.saleItemId && l.qty > 0);
+
+  if (!safeLines.length) {
+    throw new Error("No hay líneas válidas para devolver");
+  }
+
+  const saleItemIds = safeLines.map((l) => l.saleItemId);
+  const saleItems = await SaleItem.find({ _id: { $in: saleItemIds } }).session(session);
+  const saleItemMap = new Map();
+  for (const it of saleItems) saleItemMap.set(String(it._id), it);
+
+  // Valida pertenencia de ítems a la venta
+  for (const l of safeLines) {
+    const it = saleItemMap.get(String(l.saleItemId));
+    if (!it) throw new Error("Item no encontrado para devolución");
+    if (!saleItemBelongsToSale(it, saleInfo)) {
+      throw new Error("El item no pertenece a la venta");
+    }
+  }
+
+  // Retornos existentes por item
+  const agg = await SaleReturn.aggregate([
+    { $match: { sale: saleObjId, sale_item: { $in: saleItems.map((x) => x._id) } } },
+    { $group: { _id: "$sale_item", qty: { $sum: "$qty" } } },
+  ]).session(session);
+
+  const returnedMap = new Map();
+  for (const a of agg) returnedMap.set(String(a._id), toNumber(a.qty, 0));
+
+  const created = [];
+  let refundTotal = 0;
+
+  const fixedLocation = process.env.STOCK_FIXED_LOCATION || process.env.DEFAULT_STOCK_LOCATION || null;
+
+  for (const l of safeLines) {
+    const it = saleItemMap.get(String(l.saleItemId));
+    const soldQty = toNumber(it?.qty, 0);
+    const already = toNumber(returnedMap.get(String(it._id)), 0);
+    const remaining = Math.max(0, soldQty - already);
+
+    if (remaining <= 0) {
+      throw new Error("El item ya fue devuelto completamente");
+    }
+
+    if (l.qty > remaining) {
+      throw new Error(`Cantidad a devolver supera el disponible (${remaining})`);
+    }
+
+    const refund_amount = computeRefundAmountForReturn(it, l.qty);
+
+    const retDoc = new SaleReturn({
+      sale: saleObjId,
+      sale_item: it._id,
+      qty: l.qty,
+      refund_amount,
+      note: note ?? null,
+    });
+
+    await retDoc.save({ session });
+    created.append(retDoc);
+
+    refundTotal += refund_amount;
+
+    // Reingresa stock del producto final
+    const productId = getProductIdFromSaleItem(it);
+    if (!productId) {
+      throw new Error("No se pudo determinar el producto del item");
+    }
+
+    const product = await Product.findById(productId).session(session);
+    if (!product) {
+      throw new Error("Producto no encontrado para reingresar stock");
+    }
+
+    const currStock = toNumber(product.stock, 0);
+    product.stock = currStock + l.qty;
+    await product.save({ session });
+
+    const moveDoc = buildReturnMoveDoc(
+      product._id,
+      l.qty,
+      note || `Devolución venta ${saleInfo.saleStr}`,
+      user,
+      String(saleObjId),
+      fixedLocation
+    );
+
+    const invMove = new InventoryMove(moveDoc);
+    await invMove.save({ session });
+
+    // Actualiza contador local
+    returnedMap.set(String(it._id), already + l.qty);
+  }
+
+  // Actualiza estado de la venta según devoluciones acumuladas
+  const allItems = await SaleItem.find({
+    $or: [{ sale: saleObjId }, { sale_id: saleInfo.saleStr }],
+  }).session(session);
+
+  let allReturned = allItems.length > 0;
+  for (const it of allItems) {
+    const soldQty = toNumber(it?.qty, 0);
+    const returnedQty = toNumber(returnedMap.get(String(it._id)), 0);
+    if (returnedQty < soldQty) {
+      allReturned = false;
+      break;
+    }
+  }
+
+  sale.status = allReturned ? "REFUNDED" : "PARTIAL_REFUND";
+  await sale.save({ session });
+
+  return { created, refundTotal };
 }
 
 // Crea pagos asociados a una venta
@@ -621,48 +1029,108 @@ router.post("/:id/void", authMiddleware, async (req, res) => {
   }
 });
 
+
+// Crea devoluciones (batch) y reingresa stock al producto final
+router.post("/returns", authMiddleware, async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const sale_id = String(req.body?.sale_id || req.body?.saleId || "");
+    const lines = Array.isArray(req.body?.items) ? req.body.items : [];
+    const note = req.body?.note ?? null;
+
+    if (!sale_id) {
+      return res.status(400).json({ ok: false, error: "sale_id requerido" });
+    }
+    if (!lines.length) {
+      return res.status(400).json({ ok: false, error: "items requeridos" });
+    }
+
+    let saleOut = null;
+    let createdReturns = [];
+
+    await session.withTransaction(async () => {
+      const sale = await Sale.findById(sale_id).session(session);
+      if (!sale) {
+        throw new Error("Venta no encontrada");
+      }
+
+      const out = await applyReturnsBatchInTxn({ sale, lines, note, user: req.user, session });
+      createdReturns = out.created;
+
+      saleOut = sale;
+    });
+
+    return res.json({
+      ok: true,
+      sale: saleOut ? saleOut.toJSON() : null,
+      returns: createdReturns.map((r) => r.toJSON()),
+    });
+  } catch (error) {
+    const msg = String(error?.message || "Error al crear devolución");
+    console.error("Error al crear devolución batch:", msg);
+    return res.status(400).json({ ok: false, error: msg });
+  } finally {
+    session.endSession();
+  }
+});
+
 // Crea devolución parcial de un item de venta
 router.post("/:id/returns", authMiddleware, async (req, res) => {
+  const session = await mongoose.startSession();
+
   try {
-    const saleId = String(req.params.id || "");
-    const sale_item = req.body?.sale_item;
-    const qty = Number(req.body?.qty || 0);
-    const refund_amount = roundInt(req.body?.refund_amount);
+    const saleId = String(req.params.id || "").trim();
+    const sale_item = req.body?.sale_item || req.body?.sale_item_id || req.body?.saleItemId;
+    const qty = toInt(req.body?.qty, 0);
+    const note = req.body?.note ?? null;
 
     if (!sale_item) {
       return res.status(400).json({ ok: false, error: "sale_item requerido" });
     }
-    if (!Number.isFinite(qty) || qty <= 0) {
+    if (!(qty > 0)) {
       return res.status(400).json({ ok: false, error: "Cantidad inválida" });
     }
-    if (!Number.isFinite(refund_amount) || refund_amount < 0) {
-      return res.status(400).json({ ok: false, error: "Monto inválido" });
-    }
 
-    const sale = await Sale.findById(saleId);
-    if (!sale) {
-      return res.status(404).json({ ok: false, error: "Venta no encontrada" });
-    }
+    let createdItem = null;
+    let updatedSale = null;
 
-    const item = await SaleItem.findById(String(sale_item));
-    if (!item) {
-      return res.status(404).json({ ok: false, error: "Item no encontrado" });
-    }
+    await session.withTransaction(async () => {
+      const sale = await Sale.findById(saleId).session(session);
+      if (!sale) {
+        throw new Error("Venta no encontrada");
+      }
 
-    const created = await SaleReturn.create({
-      sale: sale.id,
-      sale_item: item.id,
-      qty,
-      refund_amount,
-      note: req.body?.note ?? null,
+      if (sale.status === "VOIDED") {
+        throw new Error("La venta está anulada");
+      }
+
+      if (sale.status === "REFUNDED") {
+        throw new Error("La venta ya está reembolsada");
+      }
+
+      const lines = [{ sale_item_id: String(sale_item), qty }];
+      const r = await applyReturnsBatchInTxn({ sale, lines, note, user: req.user, session });
+
+      const first = (r?.created || [])[0] || null;
+      createdItem = first;
+      updatedSale = sale;
     });
 
-    return res.json({ ok: true, item: created.toJSON() });
+    return res.json({
+      ok: true,
+      sale: updatedSale ? updatedSale.toJSON() : null,
+      item: createdItem ? createdItem.toJSON() : null,
+    });
   } catch (error) {
     console.error("Error al crear devolución:", error.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error al crear devolución" });
+    return res.status(400).json({ ok: false, error: error.message || "Error" });
+  } finally {
+    try {
+      session.endSession();
+    } catch (e) {
+      // no-op
+    }
   }
 });
 
